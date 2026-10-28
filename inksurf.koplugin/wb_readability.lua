@@ -1,9 +1,9 @@
 --[[
-Helyi „olvasó nézet" – a fő cikktörzs kivonatolása harmadik fél NÉLKÜL.
-Bemenet: nyers HTML + a wb_html modul (H). Kimenet: letisztított HTML
-(cím + cikk), amit a meglévő megjelenítő renderel. Heurisztikus pontozás:
-a legtöbb bekezdés-szöveget tartalmazó blokkot választja, a linksűrű
-(menü/lábléc) blokkokat bünteti.
+Local "reader view" – extract the main article body WITHOUT third parties.
+Input: raw HTML + the wb_html module (H). Output: cleaned HTML
+(title + article), rendered by the existing renderer. Heuristic scoring:
+select the block containing the most paragraph text, penalizing link-heavy
+(menu/footer) blocks.
 ]]
 
 local Readability = {}
@@ -27,7 +27,7 @@ local function escAttr(v)
     return (tostring(v):gsub('[&"<>]', { ["&"] = "&amp;", ['"'] = "&quot;", ["<"] = "&lt;", [">"] = "&gt;" }))
 end
 
--- egy node teljes szöveghossza és a benne lévő linkek szöveghossza
+-- total text length of a node and text length of the links it contains
 local function measure(H, node)
     local t = #(H.text(node) or "")
     local lt = 0
@@ -36,7 +36,7 @@ local function measure(H, node)
     return t, lt
 end
 
--- a legtöbb cikk-szöveget tartalmazó blokk megkeresése
+-- find the block containing the most article text
 local function findArticle(H, root)
     local best, bestScore = nil, 0
     local function walk(node)
@@ -45,7 +45,7 @@ local function findArticle(H, root)
             if t > 160 then
                 local np = #(H.select(node, "p", 1000) or {})
                 local score = (t - lt) + np * 30
-                if t > 0 and (lt / t) > 0.5 then score = score * 0.25 end  -- linksűrű blokk büntetése
+                if t > 0 and (lt / t) > 0.5 then score = score * 0.25 end  -- penalize link-heavy blocks
                 if score > bestScore then best, bestScore = node, score end
             end
         end
@@ -57,10 +57,10 @@ local function findArticle(H, root)
     return best
 end
 
--- a kiválasztott blokk letisztított HTML-lé alakítása (fehérlista szerint)
+-- convert the selected block to cleaned HTML (using an allowlist)
 local function emit(node, out)
     if node.text then
-        out[#out + 1] = node.text        -- nyers szöveg (entitásokkal) HTML-ként rendben
+        out[#out + 1] = node.text        -- raw text (with entities) is valid as HTML
         return
     end
     local tag = node.tag
@@ -87,7 +87,7 @@ local function emit(node, out)
     end
 end
 
--- html: nyers HTML; H: a wb_html modul. Visszaad: letisztított HTML vagy nil.
+-- html: raw HTML; H: the wb_html module. Returns: cleaned HTML or nil.
 function Readability.clean(html, H)
     if not html or html == "" then return nil end
     local ok, root = pcall(H.parse, html)
@@ -105,7 +105,7 @@ function Readability.clean(html, H)
     for _, ch in ipairs(body.children or {}) do emit(ch, out) end
     local inner = table.concat(out)
 
-    -- ha a kinyert szöveg túl rövid, valószínűleg nem cikk
+    -- if the extracted text is too short, it is probably not an article
     local plain = inner:gsub("<[^>]*>", "")
     if #plain < 200 then return nil end
 

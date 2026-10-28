@@ -1,7 +1,7 @@
 --[[
-VPN (OpenVPN) vezérlés – a BookFetch pluginból átvéve.
-A tényleges munkát a vpn.sh végzi (IPv6-tiltás, kill switch, DNS).
-Singleton modul.
+VPN (OpenVPN) control – adapted from the BookFetch plugin.
+The actual work is done by vpn.sh (disabling IPv6, kill switch, DNS).
+Singleton module.
 ]]
 
 local InfoMessage = require("ui/widget/infomessage")
@@ -11,7 +11,7 @@ local UIManager = require("ui/uimanager")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 
--- i18n (megosztott singleton; a plugin mappájából töltve) ---------------------
+-- i18n (shared singleton; loaded from the plugin directory) ---------------------
 local _i18n_pdir = (debug.getinfo(1, "S").source or ""):match("^@(.*)/[^/]*$") or "plugins/inksurf.koplugin"
 local I18N = package.loaded["inksurf_i18n"]
 if not I18N then
@@ -21,7 +21,7 @@ end
 local function S(s) return I18N.tr(s) end
 
 
-local SETTING_OVPN = "bookfetch_ovpn" -- a régi pluginnal közös, így megmarad a választott szerver
+local SETTING_OVPN = "bookfetch_ovpn" -- shared with the old plugin to preserve the selected server
 
 local function q(s)
     return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
@@ -42,13 +42,13 @@ local function withBusy(text, fn)
     local ok, res = pcall(fn)
     UIManager:close(msg)
     if not ok then
-        logger.warn("WebBrowser VPN hiba:", res)
+        logger.warn("WebBrowser VPN error:", res)
         return "HIBA " .. tostring(res)
     end
     return res
 end
 
--- Az utolsó "OK ..." vagy "HIBA ..." sor
+-- The last "OK ..." or "HIBA ..." line
 local function parseResult(out)
     local status, msg
     for line in out:gmatch("[^\n]+") do
@@ -60,19 +60,19 @@ local function parseResult(out)
     return status, msg
 end
 
--- A KOReader futó folyamata induláskor megjegyzi a /etc/resolv.conf tartalmát.
--- VPN-váltás után újra kell olvastatni, különben a régi (router) DNS-t használja.
--- Többféle libc-szimbólumot próbálunk (glibc: __res_init / res_init; libresolv is lehet).
+-- The KOReader process caches the contents of /etc/resolv.conf at startup.
+-- Reload it after switching VPNs; otherwise it uses the old (router) DNS.
+-- Try several libc symbols (glibc: __res_init / res_init; possibly libresolv too).
 local function resInit()
     local ok, ffi = pcall(require, "ffi")
-    if not ok then return false, "nincs ffi" end
+    if not ok then return false, "ffi unavailable" end
     pcall(ffi.cdef, "int __res_init(void); int res_init(void);")
     local tried = {}
     for _i, sym in ipairs({ "__res_init", "res_init" }) do
         local okc, rv = pcall(function() return ffi.C[sym]() end)
         if okc then return true, sym .. "=" .. tostring(rv) end
         tried[#tried + 1] = sym
-        -- libresolv.so is, ha a főnévtérben nincs meg
+        -- Also try libresolv.so if the symbol is not in the main namespace
         for _j, lib in ipairs({ "resolv", "libresolv.so.2", "libresolv.so" }) do
             local okl, L = pcall(ffi.load, lib)
             if okl then
@@ -81,17 +81,17 @@ local function resInit()
             end
         end
     end
-    return false, "egyik sem: " .. table.concat(tried, ", ")
+    return false, "none available: " .. table.concat(tried, ", ")
 end
 
 local UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
--- Kapcsolatpróba a KOReader saját folyamatából (pontosan azon az úton, amit a böngésző használ).
--- Visszatérés: ip | nil, info, reached  (reached=true, ha BÁRMILYEN HTTP-választ kaptunk –
--- ekkor a hálózat rendben van, csak a tesztcím utasította el a kérést)
+-- Test connectivity from KOReader's own process (using exactly the same path as the browser).
+-- Returns: ip | nil, info, reached  (reached=true if ANY HTTP response was received –
+-- in that case the network is fine; only the test endpoint rejected the request)
 local function selfTest()
     local okh, http = pcall(require, "socket.http")
-    if not okh then return nil, "nincs socket.http", false end
+    if not okh then return nil, "socket.http unavailable", false end
     local ltn12 = require("ltn12")
     local socket = require("socket")
     local okt, socketutil = pcall(require, "socketutil")
@@ -109,12 +109,12 @@ local function selfTest()
         return (table.concat(chunks):match("[%d%.:a-fA-F]+")), nil, true
     end
     if ok and type(code) == "number" then
-        return nil, "HTTP " .. code, true -- elért szervert: a hálózat jó
+        return nil, "HTTP " .. code, true -- reached the server: the network is fine
     end
     return nil, tostring(code), false
 end
 
--- Egy hosztnév feloldása a KOReader folyamatából (ez a glibc resolvert használja)
+-- Resolve a hostname from the KOReader process (this uses the glibc resolver)
 local function resolveHost(host)
     local socket = require("socket")
     local okt, socketutil = pcall(require, "socketutil")
@@ -124,7 +124,7 @@ local function resolveHost(host)
     return ip, err
 end
 
--- HTTP-próba KÖZVETLENÜL egy IP-re (DNS nélkül) – ez a hálózati útvonalat/kill switchöt teszteli
+-- HTTP probe DIRECTLY to an IP (without DNS) – tests the network route/kill switch
 local function httpToIp(ip, host, path)
     local http = require("socket.http")
     local ltn12 = require("ltn12")
@@ -144,8 +144,8 @@ local function httpToIp(ip, host, path)
     return nil, tostring(code)
 end
 
--- Friss folyamat (wget) a rendszer szintjén – ha ez megy, de a KOReaderé nem,
--- akkor a KOReader folyamat DNS-gyorsítótára a hibás (resInit kell).
+-- A fresh process (wget) at the system level – if this works but KOReader's probe does not,
+-- the KOReader process's DNS cache is at fault (resInit is needed).
 local function wgetProbe()
     local p = io.popen("wget -T 10 -qO- http://ifconfig.me/ip 2>/dev/null")
     if not p then return nil end
@@ -158,15 +158,15 @@ local VPN = {}
 
 function VPN:setup(opts)
     self.plugin_dir = opts.plugin_dir
-    self.settings = opts.settings -- a plugin saját, önálló beállításfájlja (ha van)
+    self.settings = opts.settings -- the plugin's own separate settings file (if any)
     self.vpn_dir = opts.plugin_dir .. "/vpn/"
     self.script = opts.plugin_dir .. "/vpn.sh"
     self.auth = self.vpn_dir .. "auth.txt"
     self.on_up = opts.on_up
     self.on_down = opts.on_down
     if lfs.attributes(self.vpn_dir, "mode") ~= "directory" then lfs.mkdir(self.vpn_dir) end
-    -- ön-gyógyítás induláskor: ha egy korábbi futásból beragadt a kill switch / zárolt
-    -- resolv.conf (nincs internet), takarítsuk ki a háttérben (csak ha a VPN nem fut)
+    -- Self-healing at startup: clean up a stuck kill switch / locked resolv.conf
+    -- from a previous run (no internet) in the background (only if the VPN is not running)
     pcall(function()
         os.execute("sh " .. q(self.script) .. " heal >/dev/null 2>&1 &")
     end)
@@ -219,9 +219,9 @@ function VPN:currentOvpn()
     return nil
 end
 
--- Szolgáltatónkénti belépési adatok: ha van <szervernev>.auth a vpn/ mappában,
--- azt használjuk (így Express és Nord külön loginnal, egyszerre megférnek);
--- különben a közös auth.txt a tartalék.
+-- Per-provider credentials: use <servername>.auth in the vpn/ directory if present
+-- (so Express and Nord can coexist with separate logins);
+-- otherwise fall back to the shared auth.txt.
 function VPN:authFor(ovpn)
     if ovpn then
         local per = self.vpn_dir .. ovpn:gsub("%.ovpn$", "") .. ".auth"
@@ -230,8 +230,8 @@ function VPN:authFor(ovpn)
     return self.auth
 end
 
--- Mentéskor: ha van kiválasztott szerver, a hozzá tartozó <nev>.auth fájlba írunk;
--- ha nincs, a közös auth.txt-be (visszafelé kompatibilis).
+-- When saving: if a server is selected, write to its <name>.auth file;
+-- otherwise write to the shared auth.txt (backward compatible).
 function VPN:authWritePath(ovpn)
     if ovpn then
         return self.vpn_dir .. ovpn:gsub("%.ovpn$", "") .. ".auth"
@@ -239,7 +239,7 @@ function VPN:authWritePath(ovpn)
     return self.auth
 end
 
--- done(ok) opcionális visszahívás
+-- done(ok) is an optional callback
 function VPN:up(done)
     local ovpn = self:currentOvpn()
     if not ovpn then
@@ -273,13 +273,13 @@ function VPN:up(done)
         if self.on_up then pcall(self.on_up) end
         if done then done(ip ~= nil or reached == true) end
     else
-        notify("VPN hiba:\n" .. (msg or ""))
+        notify("VPN error:\n" .. (msg or ""))
         if done then done(false) end
     end
 end
 
 function VPN:down()
-    -- előbb a torrentek leállítása, hogy VPN nélkül ne töltsenek tovább
+    -- Stop torrents first so they do not continue downloading without the VPN
     if self.on_down then pcall(self.on_down) end
     local out = withBusy(S("VPN leállítása…"), function() return self:runScript("down") end)
     resInit()
@@ -307,14 +307,14 @@ function VPN:status()
     end
 end
 
--- Lépésről lépésre megkeresi, hol akad el a kapcsolat VPN alatt.
+-- Find step by step where the connection fails while using the VPN.
 function VPN:diagnose()
     local L = {}
     local function add(s) L[#L + 1] = s end
     local route_ok, dns_ok, fetch_ok, reach_ok = false, false, false, false
-    withBusy("Diagnosztika fut…\n(10-20 mp)", function()
-        add(S("tun0 létezik: ") .. (lfs.attributes("/sys/class/net/tun0", "mode") and "IGEN" or "NEM"))
-        add("ovpn.pid: " .. (fileExists("/tmp/bookfetch/ovpn.pid") and "van" or "nincs"))
+    withBusy("Running diagnostics…\n(10-20 s)", function()
+        add(S("tun0 létezik: ") .. (lfs.attributes("/sys/class/net/tun0", "mode") and "YES" or "NO"))
+        add("ovpn.pid: " .. (fileExists("/tmp/bookfetch/ovpn.pid") and "present" or "missing"))
         local rf = io.open("/etc/resolv.conf", "r")
         if rf then
             local c = (rf:read("*a") or ""):gsub("%s+$", "")
@@ -322,7 +322,7 @@ function VPN:diagnose()
             add("resolv.conf:\n  " .. c:gsub("\n", "\n  "))
         end
         local okr, info = resInit()
-        add(S("DNS újratöltés (res_init): ") .. (okr and ("OK [" .. info .. "]") or ("SIKERTELEN [" .. tostring(info) .. "]")))
+        add(S("DNS újratöltés (res_init): ") .. (okr and ("OK [" .. info .. "]") or ("FAILED [" .. tostring(info) .. "]")))
 
         add("")
         add(S("1) Útvonal DNS nélkül (IP-re, 1.1.1.1):"))
@@ -332,7 +332,7 @@ function VPN:diagnose()
             local ip = body and body:match("ip=([%d%.:a-fA-F]+)")
             add("   OK (HTTP " .. code .. ")" .. (ip and (S(", kimenő IP: ") .. ip) or ""))
         else
-            add("   NEM MEGY (" .. tostring(body) .. S(")  → a kill switch vagy az útvonal a hibás"))
+            add("   FAILED (" .. tostring(body) .. S(")  → a kill switch vagy az útvonal a hibás"))
         end
 
         add("")
@@ -342,7 +342,7 @@ function VPN:diagnose()
             dns_ok = true
             add("   OK: one.one.one.one -> " .. dip)
         else
-            add("   NEM MEGY (" .. tostring(derr) .. S(")  → a DNS-gyorsítótár a hibás"))
+            add("   FAILED (" .. tostring(derr) .. S(")  → a DNS-gyorsítótár a hibás"))
         end
 
         add("")
@@ -355,7 +355,7 @@ function VPN:diagnose()
         elseif reached then
             add(S("   Kapcsolat OK, de a tesztcím elutasított (") .. tostring(serr) .. S(") – a hálózat MŰKÖDIK"))
         else
-            add("   NEM MEGY (" .. tostring(serr) .. ")")
+            add("   FAILED (" .. tostring(serr) .. ")")
         end
     end)
 
@@ -369,7 +369,7 @@ function VPN:diagnose()
     else
         summary = S("A feloldás és az útvonal is megy, a teljes letöltés mégsem – valószínűleg HTTPS/tanúsítvány gond vagy a cél blokkolja a kérést.")
     end
-    table.insert(L, 1, "VPN DIAGNOSZTIKA\n================\n")
+    table.insert(L, 1, "VPN DIAGNOSTICS\n===============\n")
     table.insert(L, "\n>>> " .. summary)
     UIManager:show(TextViewer:new{ title = S("VPN diagnosztika"), text = table.concat(L, "\n") })
 end
@@ -412,7 +412,7 @@ function VPN:showCredentialsDialog()
                 out:write(u, "\n", p, "\n")
                 out:close()
                 UIManager:close(dialog)
-                notify(S("Bejelentkezési adatok elmentve") .. (server and (" ehhez: " .. server) or "") .. ".", 2)
+                notify(S("Bejelentkezési adatok elmentve") .. (server and (" for: " .. server) or "") .. ".", 2)
             end },
         }},
     }
@@ -438,7 +438,7 @@ function VPN:serverMenu()
     return items
 end
 
--- KOReader főmenü almenü-elemei
+-- Submenu items for the KOReader main menu
 function VPN:menuItems()
     return {
         {
@@ -459,7 +459,7 @@ function VPN:menuItems()
         {
             text_func = function()
                 local cur = self:currentOvpn()
-                return "VPN szerver: " .. (cur and cur:gsub("%.ovpn$", "") or S("nincs kiválasztva"))
+                return "VPN server: " .. (cur and cur:gsub("%.ovpn$", "") or S("nincs kiválasztva"))
             end,
             sub_item_table_func = function() return self:serverMenu() end,
         },

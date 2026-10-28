@@ -1,10 +1,10 @@
 --[[
-Torrent letöltés a háttérben aria2c-vel (JSON-RPC-n keresztül vezérelve).
-- .torrent fájl vagy magnet link -> aria2 letölti a Downloads/.torrent/<job> mappába
-- kész: a könyvfájl(oka)t áthelyezi a letöltési mappába, és felajánlja a megnyitást
-- seedelés nincs (seed-time=0)
-- elakadás figyelése: beállítható idő után "ELAKADT", opcionálisan automatikus törlés
-Singleton modul: egyetlen poller fut, akárhány plugin-példány hívja.
+Background torrent downloads with aria2c (controlled via JSON-RPC).
+- .torrent file or magnet link -> aria2 downloads to Downloads/.torrent/<job>
+- on completion: moves the book file(s) to the download directory and offers to open them
+- no seeding (seed-time=0)
+- stall monitoring: marked "STALLED" after a configurable timeout, with optional automatic deletion
+Singleton module: only one poller runs, regardless of how many plugin instances call it.
 ]]
 
 local ButtonDialog = require("ui/widget/buttondialog")
@@ -28,7 +28,7 @@ if not has_json then json = require("rapidjson") end
 local has_socketutil, socketutil = pcall(require, "socketutil")
 if not has_socketutil then socketutil = nil end
 
--- i18n (megosztott singleton; a plugin mappájából töltve) ---------------------
+-- i18n (shared singleton; loaded from the plugin directory) ---------------------
 local _i18n_pdir = (debug.getinfo(1, "S").source or ""):match("^@(.*)/[^/]*$") or "plugins/inksurf.koplugin"
 local I18N = package.loaded["inksurf_i18n"]
 if not I18N then
@@ -42,7 +42,7 @@ local RPC_PORT = 16800
 local POLL_INTERVAL = 5
 
 ---------------------------------------------------------------------------
--- Segédek
+-- Helpers
 ---------------------------------------------------------------------------
 
 local function q(s)
@@ -57,7 +57,7 @@ local function jstr(s)
     return '"' .. s:gsub('[%c"\\]', function(c) return JESC[c] or string.format("\\u%04x", c:byte()) end) .. '"'
 end
 
--- saját JSON-kódoló, hogy az üres tömb biztosan [] legyen
+-- Custom JSON encoder to ensure an empty array is encoded as []
 local function jencode(v)
     local t = type(v)
     if t == "string" then return jstr(v)
@@ -118,7 +118,7 @@ local function ensureDir(d)
     return d
 end
 
--- csak a saját .torrent/<job> mappáinkat engedjük törölni
+-- Only allow deletion of our own .torrent/<job> directories
 local function rmrf(dir)
     if dir and dir:find("/%.torrent/[^/]+$") then
         os.execute("rm -rf " .. q(dir))
@@ -137,7 +137,7 @@ local function getPid()
 end
 
 ---------------------------------------------------------------------------
--- Modul
+-- Module
 ---------------------------------------------------------------------------
 
 local T = {
@@ -150,8 +150,8 @@ function T:setup(opts)
     self.data_dir = opts.data_dir
     self.download_dir_fn = opts.download_dir_fn
     self.before_open = opts.before_open
-    self.can_run_fn = opts.can_run_fn -- pl. "csak VPN-nel": false esetén nem indul/folytatódik
-    self.on_unopenable = opts.on_unopenable -- KOReader által nem nyitható kész fájlok (pl. azw3 -> EPUB felajánlás)
+    self.can_run_fn = opts.can_run_fn -- e.g. "VPN only": do not start/resume if false
+    self.on_unopenable = opts.on_unopenable -- completed files KOReader cannot open (e.g. azw3 -> offer EPUB conversion)
     if not self.settings then
         self.settings = LuaSettings:open(opts.settings_path or (DataStorage:getSettingsDir() .. "/inksurf_torrent.lua"))
         self.jobs = self.settings:readSetting("jobs") or {}
@@ -163,7 +163,7 @@ function T:setup(opts)
             self.settings:flush()
         end
         self._poll = function() self:poll() end
-        -- KOReader újraindítás után a félbemaradt letöltések folytatása
+        -- Resume unfinished downloads after restarting KOReader
         if self:hasActive() then
             UIManager:scheduleIn(15, function()
                 if self:hasActive() and self:canRun() and self:ensureDaemon() then self:startPolling() end
@@ -184,7 +184,7 @@ function T:canRun()
     return not self.can_run_fn or self.can_run_fn()
 end
 
--- az aria2 háttérfolyamatként a "/" mappába vált, ezért minden útvonal abszolút
+-- aria2 changes to the "/" directory when daemonized, so all paths must be absolute
 function T:binPath() return absPath(self.plugin_dir .. "/bin/aria2c") end
 function T:certPath() return absPath(self.plugin_dir .. "/bin/cacert.pem") end
 function T:dataDir()
@@ -229,7 +229,7 @@ function T:rpc(method, params)
     if not ok or type(code) ~= "number" then return nil, S("Nem érem el az aria2-t."), true end
     local okd, r = pcall(json.decode, table.concat(chunks))
     if not okd or type(r) ~= "table" then return nil, S("Hibás válasz az aria2-től.") end
-    if type(r.error) == "table" then return nil, tostring(r.error.message or "aria2 hiba") end
+    if type(r.error) == "table" then return nil, tostring(r.error.message or "aria2 error") end
     return r.result
 end
 
@@ -277,7 +277,7 @@ function T:ensureDaemon()
     return false, S("Az aria2 nem indult el.\nNapló: ") .. dd .. "/aria2.log"
 end
 
--- Hozzáadás ------------------------------------------------------------------
+-- Adding ------------------------------------------------------------------
 
 function T:newJobDir()
     math.randomseed(os.time())
@@ -331,7 +331,7 @@ function T:addMagnet(magnet)
     self:add("magnet", magnet, name)
 end
 
--- Figyelés --------------------------------------------------------------------
+-- Monitoring --------------------------------------------------------------------
 
 function T:startPolling()
     if self.polling then return end
@@ -367,7 +367,7 @@ function T:updateJob(job, now, gap)
     local st, err, conn = self:rpc("aria2.tellStatus", { job.gid, keys })
     if not st then
         if conn then
-            -- az aria2 nem fut (pl. KOReader újraindult) -> újraindítjuk, a session folytatja
+            -- aria2 is not running (e.g. KOReader restarted) -> restart it; the session resumes
             if not self.daemon_checked and self:canRun() then
                 self.daemon_checked = true
                 self:ensureDaemon()
@@ -393,7 +393,7 @@ function T:updateJob(job, now, gap)
 
     if st.status == "complete" then
         if type(st.followedBy) == "table" and st.followedBy[1] then
-            -- magnet: a metaadat megjött, innentől a valódi letöltést figyeljük
+            -- magnet: metadata has arrived; monitor the actual download from now on
             self:rpc("aria2.removeDownloadResult", { job.gid })
             job.gid = st.followedBy[1]
             job.last_change = now
@@ -414,7 +414,7 @@ function T:updateJob(job, now, gap)
         job.last_change = now
     else
         job.state = "active"
-        -- ha a Kindle aludt (nagy kihagyás a lekérdezések között), nem számít elakadásnak
+        -- If the Kindle was asleep (a long gap between polls), do not count it as a stall
         if gap > POLL_INTERVAL * 6 or completed ~= job.last_completed then
             job.last_change = now
             job.last_completed = completed
@@ -464,7 +464,7 @@ function T:finish(job)
     end
     if #openable == 1 then
         UIManager:show(ConfirmBox:new{
-            text = S("Kész a torrent letöltés:\n") .. basename(openable[1]) .. "\n\nMegnyitod most?",
+            text = S("Kész a torrent letöltés:\n") .. basename(openable[1]) .. "\n\nOpen it now?",
             ok_text = S("Megnyitás"),
             cancel_text = S("Később"),
             ok_callback = function() self:openFile(openable[1]) end,
@@ -480,10 +480,10 @@ function T:finish(job)
             end }})
         end
         table.insert(buttons, {{ text = S("Bezárás"), callback = function() UIManager:close(dlg) end }})
-        dlg = ButtonDialog:new{ title = S("Kész: ") .. job.name .. "\nMelyiket nyissam meg?", buttons = buttons }
+        dlg = ButtonDialog:new{ title = S("Kész: ") .. job.name .. "\nWhich one should I open?", buttons = buttons }
         UIManager:show(dlg)
     elseif #moved > 0 and self.on_unopenable then
-        -- KOReader nem tudja megnyitni (pl. azw3): a főmodul felajánlhatja az EPUB-konverziót
+        -- KOReader cannot open it (e.g. azw3): the main module may offer EPUB conversion
         self.on_unopenable(moved)
     else
         UIManager:show(InfoMessage:new{
@@ -494,7 +494,7 @@ function T:finish(job)
     end
 end
 
--- VPN lekapcsolásakor: aria2 leállítása (a session elmenti az állást)
+-- When the VPN is disconnected: stop aria2 (the session saves progress)
 function T:suspendAll()
     if self:isRunning() then
         self:rpc("aria2.shutdown")
@@ -507,7 +507,7 @@ function T:suspendAll()
     self:saveJobs()
 end
 
--- VPN bekapcsolásakor: folytatás
+-- When the VPN is connected: resume
 function T:resumeAll()
     if self:hasActive() and self:canRun() then
         for _i, j in ipairs(self.jobs) do j.last_change = os.time() end
@@ -524,7 +524,7 @@ end
 function T:notifyProblem(job)
     if job.notified then return end
     job.notified = true
-    local what = (job.state == "stalled") and "Elakadt" or S("Hiba történt")
+    local what = (job.state == "stalled") and "Stalled" or S("Hiba történt")
     UIManager:show(InfoMessage:new{
         text = what .. S(" a torrent letöltésnél:\n") .. job.name
             .. (job.error and ("\n\n" .. tostring(job.error)) or "")
@@ -569,25 +569,25 @@ function T:deleteAll()
     UIManager:show(InfoMessage:new{ text = S("Minden torrent letöltés törölve, az aria2 leállítva."), timeout = 3 })
 end
 
--- Kezelőfelület ---------------------------------------------------------------
+-- User interface ---------------------------------------------------------------
 
 local function statusText(job)
     if job.state == "active" then
-        if (job.total or 0) == 0 then return "metaadat…" end
+        if (job.total or 0) == 0 then return "metadata…" end
         local pct = math.floor((job.completed or 0) * 100 / job.total)
         return string.format("%d%% · %s/s", pct, fmtSize(job.speed or 0))
     elseif job.state == "paused" then return S("szünetel")
-    elseif job.state == "stalled" then return "ELAKADT"
+    elseif job.state == "stalled" then return "STALLED"
     elseif job.state == "error" then return "HIBA"
-    elseif job.state == "lost" then return "elveszett"
+    elseif job.state == "lost" then return "lost"
     end
     return job.state or ""
 end
 
 function T:jobActions(job)
-    local info = string.format("%s\n\n%s / %s · %s\nSeederek: %d · kapcsolatok: %d",
+    local info = string.format("%s\n\n%s / %s · %s\nSeeders: %d · connections: %d",
         job.name, fmtSize(job.completed), fmtSize(job.total), statusText(job), job.seeders or 0, job.conns or 0)
-    if job.error then info = info .. "\n\nHiba: " .. tostring(job.error) end
+    if job.error then info = info .. "\n\nError: " .. tostring(job.error) end
     local dlg
     local buttons = {}
     if job.state == "active" then
@@ -628,7 +628,7 @@ function T:chooseStall()
     local dlg
     local buttons = {}
     for _i, m in ipairs({ 0, 10, 20, 30, 60, 120 }) do
-        table.insert(buttons, {{ text = (m == 0) and "Ki (nem figyeli)" or (m .. " perc"), callback = function()
+        table.insert(buttons, {{ text = (m == 0) and "Off (not monitored)" or (m .. " min"), callback = function()
             UIManager:close(dlg)
             self.settings:saveSetting("stall_minutes", m)
             self.settings:flush()
@@ -653,7 +653,7 @@ function T:managerItems()
     end
     local stall = self:stallMinutes()
     table.insert(items, {
-        text = S("⚙ Elakadásnak számít: ") .. ((stall == 0) and "ki" or (stall .. S(" perc haladás nélkül"))),
+        text = S("⚙ Elakadásnak számít: ") .. ((stall == 0) and "off" or (stall .. S(" perc haladás nélkül"))),
         callback = function() self:chooseStall() end,
     })
     table.insert(items, {

@@ -14,21 +14,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build-fuggosegek
+      - name: Build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential git autoconf automake libtool libtool-bin \
             bison flex texinfo help2man gawk gperf pkg-config \
             libncurses-dev python3 unzip wget file curl rsync
 
-      - name: Toolchain visszatoltes (ha van)
+      - name: Restore toolchain (if cached)
         id: tc-restore
         uses: actions/cache/restore@v4
         with:
           path: ~/x-tools
           key: koxtoolchain-${{ env.KOX_TARGET }}-v2
 
-      - name: koxtoolchain epitese (ha nincs)
+      - name: Build koxtoolchain (if not cached)
         if: steps.tc-restore.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 https://github.com/Niluje/koxtoolchain ~/koxtc
@@ -41,22 +41,22 @@ jobs:
           }
           ok=0
           for i in 1 2 3 4 5 6; do
-            echo "=== probalkozas #$i ==="
+            echo "=== attempt #$i ==="
             if ./gen-tc.sh ${{ env.KOX_TARGET }}; then ok=1; break; fi
-            echo "sikertelen; config.sub/guess potlasa tukorbol, ujra 20 mp mulva..."
+            echo "failed; replacing config.sub/guess from a mirror, retrying in 20 seconds..."
             seed
             sleep 20
           done
-          [ "$ok" = "1" ] || { echo "toolchain nem epult meg"; exit 1; }
+          [ "$ok" = "1" ] || { echo "toolchain build failed"; exit 1; }
 
-      - name: Toolchain mentese AZONNAL (ha most epult)
+      - name: Save toolchain IMMEDIATELY (if just built)
         if: steps.tc-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/x-tools
           key: koxtoolchain-${{ env.KOX_TARGET }}-v2
 
-      - name: Forditó megkeresese (PATH + tuple)
+      - name: Locate compiler (PATH + tuple)
         id: tuple
         run: |
           BINDIR="$(find "$HOME/x-tools" -maxdepth 2 -name bin -type d | head -n1)"
@@ -65,12 +65,12 @@ jobs:
           echo "tuple: $TUPLE"
           echo "tuple=$TUPLE" >> "$GITHUB_OUTPUT"
 
-      - name: NetSurf + FBInk forditasa
+      - name: Build NetSurf + FBInk
         run: |
           chmod +x build.sh
           TARGET_TUPLE="${{ steps.tuple.outputs.tuple }}" JOBS="$(nproc)" ./build.sh
 
-      - name: Eredmeny feltoltese
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: netsurf-kindle

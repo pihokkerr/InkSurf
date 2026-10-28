@@ -1,18 +1,18 @@
 --[[
-NetSurf indító – egy valódi (korlátozott JavaScriptű) böngészőmotor futtatása
-a Kindle framebufferén, a KOReaderből kilépés nélkül.
+NetSurf launcher – run a real browser engine (with limited JavaScript support)
+on the Kindle framebuffer without leaving KOReader.
 
-Működés: a KOReader egyszálú, ezért amíg a blokkoló os.execute fut, a KOReader
-nem rajzol és nem olvassa a /dev/input-ot. A NetSurf így átveszi a képernyőt és
-az érintést; visszatéréskor a KOReader teljes képernyőt frissít.
+Operation: KOReader is single-threaded, so while the blocking os.execute runs,
+KOReader neither draws nor reads /dev/input. NetSurf thus takes over the screen
+and touch input; on return, KOReader refreshes the entire screen.
 
-MINIMALIZÁLÁS: a felső él lehúzásával a NetSurf megállítja magát (SIGSTOP), de
-ÉLETBEN MARAD a háttérben. A felügyelő szkript ilyenkor visszaadja a vezérlést a
-KOReadernek (state fájl = "minimized", a PID megmarad). A menüből S("Folytatás")-ra a
-NetSurföt SIGCONT-tal felébresztjük, pontosan ugyanott folytatódik.
+MINIMIZING: swiping down from the top edge makes NetSurf stop itself (SIGSTOP),
+but it STAYS ALIVE in the background. The supervisor script then returns control
+to KOReader (state file = "minimized", PID retained). Choosing "Resume" from the
+menu wakes NetSurf with SIGCONT, resuming exactly where it left off.
 
-A netsurf bináris helye: a netsurf.koplugin/bin/ alatt (külön csomag, CI építi),
-vagy a settings-ben megadott útvonalon. Ha nincs ott, a menü jelzi.
+The netsurf binary is located under netsurf.koplugin/bin/ (a separate package,
+built by CI), or at the path specified in settings. The menu indicates if it is missing.
 ]]
 
 local ConfirmBox = require("ui/widget/confirmbox")
@@ -22,7 +22,7 @@ local UIManager = require("ui/uimanager")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 
--- i18n (megosztott singleton; a plugin mappájából töltve) ---------------------
+-- i18n (shared singleton; loaded from the plugin directory) ---------------------
 local _i18n_pdir = (debug.getinfo(1, "S").source or ""):match("^@(.*)/[^/]*$") or "plugins/inksurf.koplugin"
 local I18N = package.loaded["inksurf_i18n"]
 if not I18N then
@@ -40,18 +40,18 @@ function NS:setup(opts)
     self.plugin_dir = opts.plugin_dir
     self.settings = opts.settings
     self.data_dir = opts.data_dir
-    self.download_dir_fn = opts.download_dir_fn   -- hova mentsen a NetSurf
-    self.on_downloads = opts.on_downloads         -- callback a letöltött fájlok listájával
-    self.on_menu = opts.on_menu                   -- a KOReader felső menü megnyitása (felső él lehúzás)
-    self.on_reader = opts.on_reader               -- olvasó nézet az aktuális cikkhez (sáv olvasó-ikonja)
+    self.download_dir_fn = opts.download_dir_fn   -- where NetSurf should save files
+    self.on_downloads = opts.on_downloads         -- callback with the list of downloaded files
+    self.on_menu = opts.on_menu                   -- open KOReader's top menu (swipe down from the top edge)
+    self.on_reader = opts.on_reader               -- reader view for the current article (reader icon in the bar)
 end
 
--- lehetséges helyek a binárisnak
+-- possible locations of the binary
 function NS:binary()
     local custom = self.settings and self.settings:readSetting("netsurf_bin")
     local cands = {}
     if custom then cands[#cands + 1] = custom end
-    -- a inksurf plugin mellett lévő netsurf.koplugin
+    -- netsurf.koplugin next to the inksurf plugin
     local parent = self.plugin_dir:gsub("/[^/]+/?$", "")
     cands[#cands + 1] = parent .. "/netsurf.koplugin/bin/netsurf"
     cands[#cands + 1] = parent .. "/netsurf.koplugin/bin/nsfb"
@@ -66,33 +66,33 @@ function NS:available()
     return self:binary() ~= nil
 end
 
--- állapotfájlok (a felügyelő szkript írja, mi olvassuk)
+-- state files (written by the supervisor script, read by us)
 function NS:_pidfile()   return (self.data_dir or "/mnt/us/koreader") .. "/netsurf.pid" end
 function NS:_statefile() return (self.data_dir or "/mnt/us/koreader") .. "/netsurf.state" end
--- a minimalizálás oka: a felület (kindlefb.c) ide írja: "min" / "menu" / "url"
+-- reason for minimizing: the frontend (kindlefb.c) writes "min" / "menu" / "url" here
 function NS:_signalfile() return (self.data_dir or "/mnt/us/koreader") .. "/netsurf.signal" end
--- látogatott címek naplója (a NetSurf ide fűzi minden navigációnál)
+-- visited URL log (NetSurf appends here on every navigation)
 function NS:_historyfile() return (self.data_dir or "/mnt/us/koreader") .. "/netsurf.history" end
--- a mezőbe injektálandó szöveg (a KOReader billentyűzettel beírva)
--- Böngésző-azonosító (User-Agent). Alapból Firefox (jobb oldalkompatibilitás a beégetett
--- NetSurf-UA-nál); "netsurf" esetén a motor saját UA-ja marad (nincs env-export).
+-- text to inject into the field (entered with the KOReader keyboard)
+-- Browser identifier (User-Agent). Defaults to Firefox (better site compatibility than
+-- the hardcoded NetSurf UA); "netsurf" keeps the engine's own UA (no environment export).
 local UA_STRINGS = {
     firefox = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
     chrome  = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 }
 function NS:_userAgent()
-    -- Alapértelmezett: NetSurf (a beépített UA) — ezt fogadja el a beépített DuckDuckGo
-    -- HTML-kereső is. A Firefox/Chrome opcionális (egyes oldalakhoz), de a DDG-keresőt
-    -- bot-ellenőrzésre válthatja.
+    -- Default: NetSurf (the built-in UA) — also accepted by the built-in DuckDuckGo
+    -- HTML search. Firefox/Chrome are optional (for some sites), but may trigger
+    -- bot verification in DDG search.
     local pref = (self.settings and self.settings:readSetting("netsurf_ua")) or "netsurf"
-    return UA_STRINGS[pref]   -- "netsurf"/ismeretlen -> nil -> a beépített UA marad
+    return UA_STRINGS[pref]   -- "netsurf"/unknown -> nil -> keep the built-in UA
 end
 
 function NS:_injectfile() return (self.data_dir or "/mnt/us/koreader") .. "/netsurf.inject" end
 function NS:_fieldtextfile() return (self.data_dir or "/mnt/us/koreader") .. "/netsurf.fieldtext" end
 function NS:_fieldlog() return (self.data_dir or "/mnt/us/koreader") .. "/netsurf_field.log" end
 
--- az utolsó N egyedi látogatott cím, legfrissebb elöl
+-- the last N unique visited URLs, newest first
 function NS:historyList(n)
     n = n or 5
     local seen, order = {}, {}
@@ -102,7 +102,7 @@ function NS:historyList(n)
         line = line:gsub("%s+$", "")
         if line ~= "" then
             if seen[line] then
-                -- már volt: toljuk a végére (legfrissebb)
+                -- already seen: move to the end (most recent)
                 for i = #order, 1, -1 do if order[i] == line then table.remove(order, i) break end end
             end
             seen[line] = true
@@ -110,7 +110,7 @@ function NS:historyList(n)
         end
     end
     f:close()
-    -- ha túl nagyra nőtt, visszaírjuk az utolsó ~50 egyedit (karbantartás)
+    -- if it has grown too large, write back the last ~50 unique URLs (maintenance)
     if #order > 80 then
         local keep = {}
         for i = math.max(1, #order - 50 + 1), #order do keep[#keep + 1] = order[i] end
@@ -127,7 +127,7 @@ function NS:historyClear()
     os.remove(self:_historyfile())
 end
 
--- van-e minimalizált (megállított, de élő) munkamenet?
+-- is there a minimized session (stopped but alive)?
 function NS:hasMinimized()
     local sf = io.open(self:_statefile(), "r")
     if not sf then return false end
@@ -137,13 +137,13 @@ function NS:hasMinimized()
     if not pf then return false end
     local pid = tonumber((pf:read("*l") or "")); pf:close()
     if not pid then return false end
-    -- él-e még? (kill -0)
+    -- is it still alive? (kill -0)
     local ok = os.execute("kill -0 " .. pid .. " 2>/dev/null")
     return (ok == true or ok == 0), pid
 end
 
--- a felügyelő-hurok shell kódja (közös a friss indításhoz és a folytatáshoz).
--- Feltételezi, hogy $NSPID már be van állítva a shellben.
+-- shell code for the supervisor loop (shared by fresh launches and resumes).
+-- Assumes $NSPID is already set in the shell.
 local function monitorTail(opts)
     local log = opts.log
     local dl_list = opts.dl_list
@@ -155,29 +155,29 @@ local function monitorTail(opts)
     local s = {}
     s[#s+1] = "echo $NSPID > " .. q(pidfile) .. "\n"
     s[#s+1] = "rm -f " .. q(statefile) .. "\n"
-    -- e-ink frissítő tartalék (megállított állapotban kihagyja)
+    -- fallback e-ink refresh (skipped while stopped)
     if has_fbink then
         s[#s+1] = "( while kill -0 $NSPID 2>/dev/null; do "
             .. "S=$(sed -e 's/.*) //' /proc/$NSPID/stat 2>/dev/null | cut -d' ' -f1); "
             .. "case \"$S\" in T|t) sleep 1; continue;; esac; "
             .. "sleep 4; " .. q(fbink) .. " -s >/dev/null 2>&1; done ) &\n"
         s[#s+1] = "FBPID=$!\n"
-        -- letöltés-figyelő: a kijelző tetejére írja ki (a KOReader be van fagyva)
+        -- download monitor: display at the top of the screen (KOReader is frozen)
         s[#s+1] = "( LAST=0; while kill -0 $NSPID 2>/dev/null; do "
             .. "if [ -f " .. q(dl_list) .. " ]; then "
             .. "C=$(wc -l < " .. q(dl_list) .. " 2>/dev/null || echo 0); "
             .. "if [ \"$C\" -gt \"$LAST\" ]; then "
             .. "N=$(tail -n1 " .. q(dl_list) .. " | sed 's#.*/##'); "
-            .. q(fbink) .. " -q -y 1 -m \"Letoltve: $N\" >/dev/null 2>&1; LAST=$C; fi; fi; "
+            .. q(fbink) .. " -q -y 1 -m \"Downloaded: $N\" >/dev/null 2>&1; LAST=$C; fi; fi; "
             .. "sleep 1; done ) &\n"
         s[#s+1] = "DLPID=$!\n"
     else
         s[#s+1] = "FBPID=\nDLPID=\n"
     end
-    -- őrkutya: a megadott idő után kilövi, ha befagyna (nem megállítva, hanem R/S állapotban)
+    -- watchdog: kill after the specified timeout if frozen (not stopped, but in R/S state)
     s[#s+1] = "( sleep " .. tostring(timeout) .. "; kill $NSPID 2>/dev/null; sleep 2; kill -9 $NSPID 2>/dev/null ) &\n"
     s[#s+1] = "WDPID=$!\n"
-    -- fő felügyelő hurok: megállás (T) -> minimalizálva; eltűnés -> bezárva
+    -- main supervisor loop: stopped (T) -> minimized; gone -> closed
     s[#s+1] = "MINI=0\n"
     s[#s+1] = "while kill -0 $NSPID 2>/dev/null; do "
         .. "S=$(sed -e 's/.*) //' /proc/$NSPID/stat 2>/dev/null | cut -d' ' -f1); "
@@ -188,21 +188,21 @@ local function monitorTail(opts)
     s[#s+1] = "kill $WDPID 2>/dev/null\n"
     s[#s+1] = "if [ \"$MINI\" = \"1\" ]; then echo minimized > " .. q(statefile)
         .. "; else rm -f " .. q(pidfile) .. " " .. q(statefile) .. "; fi\n"
-    -- a Kindle rendszer-statuszsáv visszaengedése (a KOReader a saját UI-ján úgyis átrajzol)
+    -- restore the Kindle system status bar (KOReader redraws its own UI anyway)
     s[#s+1] = "lipc-set-prop com.lab126.pillow disableEnablePillow enable >/dev/null 2>&1\n"
     s[#s+1] = "lipc-set-prop com.lab126.pillow interactive 1 >/dev/null 2>&1\n"
     s[#s+1] = "lipc-set-prop com.lab126.pillow hideAll 0 >/dev/null 2>&1\n"
     s[#s+1] = "start statusbar >/dev/null 2>&1\n"
-    if opts.verbose then s[#s+1] = "echo \"felugyelo vege (MINI=$MINI) $(date)\" >> " .. q(log) .. "\n" end
+    if opts.verbose then s[#s+1] = "echo \"supervisor finished (MINI=$MINI) $(date)\" >> " .. q(log) .. "\n" end
     return table.concat(s)
 end
 
--- Kindle rendszer-státuszsáv ("pillow": óra bal fent, akksi jobb fent) leállítása.
--- Több MTK-módszert próbálunk, mindegyik eredményét a NETSURF_FIELD_LOG-ba írjuk,
--- és kilistázzuk a pillow által kínált lipc-tulajdonságokat/eseményeket, hogy ha
--- egyik sem fog, pontosan lássuk, mit támogat a firmware.
--- Csak a GYORS parancsok (az enumerációt kivettük, az okozta a ~15 mp-es késést).
--- A firmware-ed ezekre reagált OK-val: disableEnablePillow disable és stop statusbar.
+-- Stop the Kindle system status bar ("pillow": clock at top left, battery at top right).
+-- Try several MTK methods, log each result to NETSURF_FIELD_LOG,
+-- and list the lipc properties/events offered by pillow so that if none
+-- works, we can see exactly what the firmware supports.
+-- Only FAST commands (enumeration was removed because it caused the ~15-second delay).
+-- Your firmware responded OK to: disableEnablePillow disable and stop statusbar.
 local function pillowStopBlock()
     return table.concat({
         "lipc-set-prop com.lab126.pillow disableEnablePillow disable >/dev/null 2>&1\n",
@@ -219,7 +219,7 @@ local function pillowStartCmd()
     })
 end
 
--- hosts-alapú reklámtiltás shell kódja (induláskor felfűz, EXIT-kor visszaállít)
+-- shell code for hosts-based ad blocking (append on startup, restore on EXIT)
 local function hostsBlock(nsdir, data, enabled)
     if not (enabled and lfs.attributes(nsdir .. "/ad_hosts.txt", "mode") == "file") then return "" end
     return "HB=/etc/hosts\n"
@@ -231,21 +231,21 @@ local function hostsBlock(nsdir, data, enabled)
         .. "trap 'cp \"$HBAK\" \"$HB\" 2>/dev/null; rm -f \"$HBAK\"' EXIT INT TERM; fi\n"
 end
 
--- a szkript futtatása: a KOReader input elengedése, blokkoló futtatás, majd
--- az input visszavétele, újrarajzolás, letöltések feldolgozása, állapot kiolvasása.
+-- run the script: release KOReader input, execute synchronously, then
+-- reclaim input, redraw, process downloads, and read the state.
 function NS:_execute(launch, dl_list)
-    logger.info("NetSurf felügyelő szkript:", launch)
-    os.remove(self:_signalfile())   -- régi minimalizálás-ok törlése
-    -- FIGYELEM: az inject-fájlt itt NEM töröljük! A resume() is ezen a _execute-on
-    -- megy át, és a mezőbe írt szöveget épp közvetlenül resume előtt írjuk ki; ha itt
-    -- törölnénk, a böngésző már üres fájlt találna. A gui.c olvasás után maga törli,
-    -- a friss indítás pedig a run()-ban nullázza.
+    logger.info("NetSurf supervisor script:", launch)
+    os.remove(self:_signalfile())   -- clear the previous reason for minimizing
+    -- WARNING: do NOT delete the inject file here! resume() also goes through this
+    -- _execute, and the field text is written just before resuming; deleting it here
+    -- would leave the browser with an empty file. gui.c deletes it after reading,
+    -- while a fresh launch clears it in run().
     local Screen = Device.screen
     pcall(function() Screen:refreshFull() end)
     UIManager:forceRePaint()
 
-    -- a KOReader kizárólagosan lefoglalja (EVIOCGRAB) az érintőt; elengedtetjük,
-    -- hogy a NetSurf kapjon eseményt, majd visszatéréskor újranyitjuk.
+    -- KOReader grabs touch input exclusively (EVIOCGRAB); release it so NetSurf
+    -- can receive events, then reopen it on return.
     local closed_paths = {}
     pcall(function()
         local input = Device and Device.input
@@ -273,7 +273,7 @@ function NS:_execute(launch, dl_list)
         end
     end)
 
-    -- a minimalizálás okát KORÁN kiolvassuk, mert ettől függ az újrarajzolás
+    -- read the reason for minimizing EARLY, since redrawing depends on it
     local reason = nil
     pcall(function()
         local sf = io.open(self:_signalfile(), "r")
@@ -281,10 +281,10 @@ function NS:_execute(launch, dl_list)
     end)
     os.remove(self:_signalfile())
 
-    -- OVERLAY: "url" (cím beírása) és "menu" (felső él lehúzás) esetén NEM rajzoljuk
-    -- újra a teljes KOReadert, hogy a beviteli ablak / felső menü a befagyott
-    -- böngészőkép FÖLÉ kerüljön (a böngésző ne tűnjön el). Minden más esetben teljes
-    -- újrarajzolás (valódi minimalizálás, bezárás, olvasó nézet stb.).
+    -- OVERLAY: for "url" (URL entry) and "menu" (swipe down from the top edge), do NOT
+    -- redraw all of KOReader, so the input dialog / top menu appears ABOVE the frozen
+    -- browser image (the browser stays visible). In all other cases, perform a full
+    -- redraw (actual minimizing, closing, reader view, etc.).
     local overlay = (reason == "url" or reason == "menu" or reason == "field")
     if not overlay then
         pcall(function()
@@ -299,7 +299,7 @@ function NS:_execute(launch, dl_list)
         end)
     end
 
-    -- a NetSurf alatt letöltött fájlok feldolgozása
+    -- process files downloaded in NetSurf
     pcall(function()
         local f = io.open(dl_list, "r")
         if f then
@@ -334,12 +334,12 @@ function NS:_execute(launch, dl_list)
     return ok
 end
 
--- Oldalon belüli mezőbe írás a KOReader billentyűzetével (overlay-ként, a böngésző
--- a háttérben látszik). A beírt szöveget a netsurf.inject fájlba írjuk, és
--- folytatáskor a motor a fókuszált mezőbe injektálja (ékezetekkel, Unicode-ként).
+-- Enter text in a page field using the KOReader keyboard (as an overlay, with the
+-- browser visible in the background). Write the entered text to netsurf.inject;
+-- on resume, the engine injects it into the focused field (with accents, as Unicode).
 function NS:_promptField()
     local InputDialog = require("ui/widget/inputdialog")
-    -- a böngésző kiírta a mező jelenlegi tartalmát -> előtöltjük, hogy szerkeszthető legyen
+    -- the browser wrote the field's current contents -> prefill for editing
     local cur = ""
     do
         local rf = io.open(self:_fieldtextfile(), "rb")
@@ -371,9 +371,9 @@ function NS:_promptField()
     dlg:onShowKeyboard()
 end
 
--- cím beírása a KOReader billentyűzetével (ékezetekkel), a JELENLEGI címmel
--- előtöltve; a háttérben minimalizált munkamenetet folytatjuk (Mégse) vagy
--- eldobjuk és az új címmel indítunk (Megnyitás).
+-- Enter a URL using the KOReader keyboard (with accents), prefilled with the CURRENT
+-- URL; either resume the minimized background session (Cancel), or discard it
+-- and launch with the new URL (Open).
 function NS:_promptUrl(current)
     local InputDialog = require("ui/widget/inputdialog")
     local prefill = (current and current ~= "" and current:match("^%a[%w+.-]*://")) and current or "https://"
@@ -385,13 +385,13 @@ function NS:_promptUrl(current)
         buttons = {{
             { text = S("Mégse"), callback = function()
                 UIManager:close(dlg)
-                self:resume()          -- vissza a háttérben lévő oldalra
+                self:resume()          -- return to the page in the background
             end },
             { text = S("Megnyitás"), is_enter_default = true, callback = function()
                 local u = dlg:getInputText()
                 UIManager:close(dlg)
                 if u and u ~= "" and u ~= "https://" then
-                    -- nincs séma és van szóköz/nincs pont -> keresés
+                    -- no scheme and contains a space / no dot -> search
                     if not u:match("^%a[%w+.-]*://") then
                         if u:find("%s") or not u:find("%.") then
                             u = "https://html.duckduckgo.com/html/?q=" .. u:gsub("[^%w]", function(c)
@@ -400,7 +400,7 @@ function NS:_promptUrl(current)
                             u = "https://" .. u
                         end
                     end
-                    self:run(u)        -- eldobja a minimalizáltat, friss munkamenet az új címmel
+                    self:run(u)        -- discard the minimized session, start a fresh one with the new URL
                 else
                     self:resume()
                 end
@@ -412,9 +412,9 @@ function NS:_promptUrl(current)
 end
 
 function NS:run(url)
-    -- DIAGNOSZTIKA: minden böngésző-indításkor üres mezőlog (a folytatások hozzáfűznek)
+    -- DIAGNOSTICS: clear the field log on each browser launch (resumes append)
     pcall(function() os.remove(self:_fieldlog()) end)
-    -- friss indításkor dobjuk az esetleges árva injektálandó szöveget (resume-kor NEM!)
+    -- discard any orphaned injection text on a fresh launch (NOT on resume!)
     os.remove(self:_injectfile())
     os.remove(self:_fieldtextfile())
     local bin = self:binary()
@@ -426,33 +426,33 @@ function NS:run(url)
         return
     end
 
-    -- ha van minimalizált munkamenet, és nem adtunk meg KONKRÉT új címet, folytassuk azt
+    -- if a minimized session exists and no SPECIFIC new URL was provided, resume it
     local mini = self:hasMinimized()
     if mini and (url == nil or url == "" or url == "about:welcome") then
         return self:resume()
     end
-    -- konkrét új címnél eldobjuk a minimalizált munkamenetet (új munkamenet indul)
+    -- discard the minimized session for a specific new URL (start a new session)
     if mini then self:_killSaved() end
 
     os.execute("chmod +x " .. q(bin) .. " 2>/dev/null")
     local nsdir = bin:gsub("/[^/]+$", "")
 
-    -- NetSurf beállítófájl (Choices)
+    -- NetSurf configuration file (Choices)
     local cacert = nsdir .. "/cacert.pem"
     if lfs.attributes(cacert, "mode") == "file" then
         local ch = io.open(nsdir .. "/res/Choices", "w")
         if ch then
             ch:write("ca_bundle:", cacert, "\n")
             ch:write("fb_depth:32\n")
-            -- A NATÍV eszköztárat KIKAPCSOLJUK ('q'): helyette a felület (kindlefb.c) rajzolja
-            -- a saját, KOReader-szerű felső sávot (nagy, szétszórt gombok, kisebb URL-sor,
-            -- a bezárás/minimalizálás mindig látszik, nem takarja a státuszsáv).
+            -- DISABLE the NATIVE toolbar ('q'): the frontend (kindlefb.c) instead draws
+            -- its own KOReader-like top bar (large, spaced-out buttons, a smaller URL row,
+            -- close/minimize always visible and not covered by the status bar).
             ch:write("fb_toolbar_layout:q\n")
             ch:write("fb_furniture_size:44\n")
-            -- A NetSurf saját OSK KI: minden beviteli mező (URL ÉS oldalon belüli mezők)
-            -- a KOReader billentyűzetét használja, OVERLAY-ként a böngésző fölött
-            -- (a böngésző a háttérben marad). Az oldal-mezőkbe a beírt szöveget
-            -- Unicode-ként visszainjektáljuk.
+            -- NetSurf's own OSK is OFF: all input fields (URL AND page fields) use
+            -- the KOReader keyboard as an OVERLAY above the browser
+            -- (the browser stays in the background). Text entered in page fields
+            -- is injected back as Unicode.
             ch:write("fb_osk:0\n")
             ch:write("block_advertisements:1\n")
             local fdir = nsdir .. "/res/fonts/"
@@ -474,7 +474,7 @@ function NS:run(url)
         end
     end
 
-    -- Felhasználói stíluslap (képek, reklám, olvasó mód)
+    -- User stylesheet (images, ads, reader mode)
     local reader = self.settings and self.settings:readSetting("netsurf_reader") or false
     local ucss = nsdir .. "/res/user.css"
     local uf = io.open(ucss, "w")
@@ -509,8 +509,8 @@ function NS:run(url)
     local dl_list = data .. "/netsurf_downloads.list"
     os.remove(dl_list)
     local timeout = self.settings and self.settings:readSetting("netsurf_timeout") or 1800
-    -- Hibakereső napló: alapból KI. Bekapcsolható a beállításban (netsurf_verbose=true),
-    -- ekkor keletkezik netsurf.log és netsurf_field.log a részletes nyomkövetéshez.
+    -- Debug logging: OFF by default. Enable in settings (netsurf_verbose=true)
+    -- to create netsurf.log and netsurf_field.log for detailed tracing.
     local verbose = self.settings and self.settings:readSetting("netsurf_verbose") == true or false
 
     local fbink = nsdir .. "/fbink"
@@ -523,7 +523,7 @@ function NS:run(url)
     end
     sh:write(
         "#!/bin/sh\n",
-        verbose and ("echo \"NetSurf indítás: $(date)\" > " .. q(log) .. "\n") or "",
+        verbose and ("echo \"NetSurf launch: $(date)\" > " .. q(log) .. "\n") or "",
         "export NETSURFRES=", q(nsdir .. "/res"), "\n",
         "export HOME=", q(os.getenv("HOME") or "/mnt/us"), "\n",
         has_fbink and ("chmod +x " .. q(fbink) .. " 2>/dev/null\n") or "",
@@ -537,7 +537,7 @@ function NS:run(url)
         (function() local _ua = self:_userAgent(); return _ua and ("export NETSURF_USER_AGENT=" .. q(_ua) .. "\n") or "" end)(),
         verbose and ("export NETSURF_FIELD_LOG=" .. q(self:_fieldlog()) .. "\n") or "",
         hostsBlock(nsdir, data, hosts_adblock),
-        -- Kindle rendszer-statuszsáv (óra/akku chrome) elrejtése böngészés idejére
+        -- hide the Kindle system status bar (clock/battery chrome) while browsing
         pillowStopBlock(),
         has_fbink and (q(fbink) .. " -f -k >/dev/null 2>&1\n") or "",
         q(bin), verbose and " -v" or "", " -f kindle -w 1272 -h 1696 ", q(url or "about:welcome"),
@@ -552,11 +552,11 @@ function NS:run(url)
     self:_execute(launch, dl_list)
 end
 
--- minimalizált munkamenet felébresztése (SIGCONT) és felügyelete
+-- wake (SIGCONT) and supervise a minimized session
 function NS:resume()
     local alive, pid = self:hasMinimized()
     if not alive then
-        -- nincs mit folytatni: friss indítás
+        -- nothing to resume: fresh launch
         return self:run("about:welcome")
     end
     local bin = self:binary()
@@ -578,7 +578,7 @@ function NS:resume()
     end
     sh:write(
         "#!/bin/sh\n",
-        verbose and ("echo \"NetSurf folytatás: $(date)\" >> " .. q(log) .. "\n") or "",
+        verbose and ("echo \"NetSurf resume: $(date)\" >> " .. q(log) .. "\n") or "",
         "export NETSURF_SIGNAL_FILE=", q(self:_signalfile()), "\n",
         "export NETSURF_HISTORY_FILE=", q(self:_historyfile()), "\n",
         "export NETSURF_INJECT_FILE=", q(self:_injectfile()), "\n",
@@ -588,7 +588,7 @@ function NS:resume()
         "NSPID=", tostring(pid), "\n",
         hostsBlock(nsdir, data, hosts_adblock),
         pillowStopBlock(),
-        -- felébresztés: SIGCONT. A felület a mentett képét azonnal újra kiírja.
+        -- wake up: SIGCONT. The frontend immediately redisplays its saved image.
         "kill -CONT $NSPID 2>/dev/null\n",
         monitorTail{ log = log, dl_list = dl_list, timeout = timeout, verbose = verbose,
                      pidfile = self:_pidfile(), statefile = self:_statefile(),
@@ -599,13 +599,13 @@ function NS:resume()
     self:_execute(resume_sh, dl_list)
 end
 
--- a mentett (minimalizált) munkamenet végleges kilövése
+-- permanently kill the saved (minimized) session
 function NS:_killSaved()
     local pf = io.open(self:_pidfile(), "r")
     if pf then
         local pid = tonumber((pf:read("*l") or "")); pf:close()
         if pid then
-            -- megállítottat előbb folytatni kell, hogy a TERM megfogjon
+            -- resume a stopped process first so TERM can take effect
             os.execute("kill -CONT " .. pid .. " 2>/dev/null; kill " .. pid
                 .. " 2>/dev/null; sleep 1; kill -9 " .. pid .. " 2>/dev/null")
         end

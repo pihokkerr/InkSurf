@@ -71,10 +71,10 @@ only for lawful purposes. Provided "as is", without warranty of any kind.
 
 ---
 
-### Magyar (rövid)
-Valódi webböngésző jailbreakelt Kindle-re, KOReader-pluginként, a **NetSurf** motorral.
-Telepítés: a `inksurf.koplugin` mappát másold a `koreader/plugins/`-ba, és indítsd
-újra a KOReadert. A VPN-hez a saját `.ovpn` + `.auth` fájlodat tedd a `vpn/` mappába
-(a repo **nem** tartalmaz VPN-adatokat). A felület nyelve (angol/magyar/német) a
-beállításokban váltható. Licenc: GPL-2.0-or-later; a bundle-olt komponensek licencei a
-`THIRD_PARTY_NOTICES.md`-ben.
+### Quick summary
+A real web browser for jailbroken Kindle, packaged as a KOReader plugin and powered
+by **NetSurf**. To install, copy the `inksurf.koplugin` folder into
+`koreader/plugins/` and restart KOReader. For VPN support, put your own `.ovpn` and
+`.auth` files in the `vpn/` folder (the repository contains **no** VPN credentials).
+The interface language (English/Hungarian/German) can be changed in Settings.
+License: GPL-2.0-or-later; see `THIRD_PARTY_NOTICES.md` for bundled component licenses.

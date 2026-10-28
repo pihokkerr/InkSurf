@@ -1,5 +1,5 @@
--- InkSurf i18n: hu a kulcs, mellé en + de. Angol az alapértelmezett.
--- Automatikusan generálva (gen_i18n.py). Hiányzó fordítás esetén a magyar kulcs a fallback.
+-- InkSurf i18n: Hungarian keys with English + German translations. English is the default.
+-- Automatically generated (gen_i18n.py). Missing translations fall back to the Hungarian key.
 local I = { lang = "en" }
 
 I.map = {

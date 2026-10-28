@@ -1,11 +1,11 @@
 --[[
-Egyszerű HTML -> DOM elemző és CSS-szelektor motor (külső függőség nélkül).
+Simple HTML -> DOM parser and CSS selector engine (without external dependencies).
 
-Támogatott szelektorok:
-  tag  *  #id  .osztaly  [attr]  [attr=v]  [attr^=v]  [attr$=v]  [attr*=v]  [attr~=v]  :contains(szöveg)
-  összetett:  div.item > a.title   (szóköz = leszármazott, > = közvetlen gyerek)
-  vesszővel több alternatíva:  h2 a, h3 a
-Kinyerésnél:  "szelektor@attr"  (pl. "a.link@href"),  "@href" (maga az elem),  "." (maga az elem szövege)
+Supported selectors:
+  tag  *  #id  .class  [attr]  [attr=v]  [attr^=v]  [attr$=v]  [attr*=v]  [attr~=v]  :contains(text)
+  compound:  div.item > a.title   (space = descendant, > = direct child)
+  comma-separated alternatives:  h2 a, h3 a
+Extraction:  "selector@attr"  (e.g. "a.link@href"),  "@href" (the element itself),  "." (the element's own text)
 ]]
 
 local H = {}
@@ -31,7 +31,7 @@ local AUTOCLOSE = {
 H.VOID = VOID
 
 ---------------------------------------------------------------------------
--- Entitások
+-- Entities
 ---------------------------------------------------------------------------
 
 local function utf8char(cp)
@@ -64,7 +64,7 @@ function H.decode(s)
 end
 
 ---------------------------------------------------------------------------
--- Elemzés
+-- Parsing
 ---------------------------------------------------------------------------
 
 local function parseAttrs(s)
@@ -102,7 +102,7 @@ local function parseAttrs(s)
     return attrs
 end
 
--- a tag végét adja vissza, idézőjeles attribútumértékeken belüli ">" jeleket átugorva
+-- return the end of the tag, skipping ">" characters inside quoted attribute values
 local function tagEnd(html, i)
     local j = i
     while true do
@@ -179,7 +179,7 @@ function H.parse(html)
                 pos = te + 1
                 name = name:lower()
 
-                -- implicit lezárások (pl. új <li> lezárja az előzőt)
+                -- implicit closing tags (e.g. a new <li> closes the previous one)
                 local ac = AUTOCLOSE[name]
                 if ac or CLOSES_P[name] then
                     local idx
@@ -212,11 +212,11 @@ function H.parse(html)
 end
 
 ---------------------------------------------------------------------------
--- Szöveg
+-- Text
 ---------------------------------------------------------------------------
 
 local SKIP_TEXT = set("script style head title template noscript")
--- CSS nélkül ezek tartalma egybefolyna a következő szöveggel
+-- without CSS, their contents would run into the following text
 local SPACE_AFTER = set("td th li p div span label dt dd tr h1 h2 h3 h4 h5 h6 section article header footer")
 
 function H.rawText(node, out, is_root)
@@ -239,7 +239,7 @@ function H.text(node)
 end
 
 ---------------------------------------------------------------------------
--- Szelektorok
+-- Selectors
 ---------------------------------------------------------------------------
 
 local function parseCompound(tok)
@@ -287,7 +287,7 @@ local function parseCompound(tok)
     return c
 end
 
--- egy szelektorlánc tokenekre bontása ([]-n belüli szóközöket megtartva)
+-- split a selector chain into tokens (preserving spaces inside [])
 local function tokenize(sel)
     local toks, buf, depth = {}, {}, 0
     sel = sel:gsub("%s*>%s*", " > ")
@@ -388,7 +388,7 @@ local function walk(node, fn)
     end
 end
 
--- az összes illeszkedő leszármazott (dokumentum-sorrendben)
+-- all matching descendants (in document order)
 function H.select(node, selector, limit)
     local alts = compile(selector)
     local out = {}
@@ -409,7 +409,7 @@ function H.first(node, selector)
     return H.select(node, selector, 1)[1]
 end
 
--- "szelektor@attr" / "@attr" / "." kinyerése egy elemből
+-- extract "selector@attr" / "@attr" / "." from an element
 function H.extract(node, spec)
     if not node or not spec then return nil end
     local sel, at = spec:match("^(.-)@([%w_:%-]+)$")

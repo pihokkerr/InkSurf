@@ -1,9 +1,9 @@
 --[[
-Web böngésző KOReaderhez
-- Oldalak linklistaként, űrlapok (GET/POST) kitöltése, oldal szövegének megjelenítése
-- Bármilyen fájl letöltése (Content-Type / Content-Disposition alapján, kiterjesztéstől függetlenül)
-- Sütik, átirányítások, könyvjelzők, vissza-gomb
-JavaScriptet NEM futtat.
+Web browser for KOReader
+- Pages as link lists, form filling (GET/POST), and page text display
+- Download any file (based on Content-Type / Content-Disposition, regardless of extension)
+- Cookies, redirects, bookmarks, and a back button
+Does NOT execute JavaScript.
 ]]
 
 local ButtonDialog = require("ui/widget/buttondialog")
@@ -50,8 +50,8 @@ local NetSurf = loadModule("inksurf_netsurf", "wb_netsurf.lua")
 local I18N = loadModule("inksurf_i18n", "wb_i18n.lua")
 local function S(s) return I18N.tr(s) end
 
--- Közös állapot: a fájlkezelő és az olvasó külön plugin-példányt kap,
--- a böngészési előzmények, sütik és oldalak ezért modulszinten élnek.
+-- Shared state: the file manager and reader receive separate plugin instances,
+-- so browsing history, cookies, and pages are stored at module level.
 local State = package.loaded["inksurf_state"]
 if not State then
     State = { history = {}, cookies = {}, pages = {}, auth = {}, current = nil }
@@ -64,10 +64,10 @@ if not has_socketutil then socketutil = nil end
 local UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 ---------------------------------------------------------------------------
--- Segédfüggvények
+-- Helper functions
 ---------------------------------------------------------------------------
 
--- kis/nagybetű-független Lua minta: "a" -> "[aA]"
+-- Case-insensitive Lua pattern: "a" -> "[aA]"
 local function ci(s)
     return (s:gsub("%a", function(c) return "[" .. c:lower() .. c:upper() .. "]" end))
 end
@@ -110,7 +110,7 @@ local function stripTags(s)
     return trim(s)
 end
 
--- attribútum kiolvasása egy tag attribútum-szövegéből (szóközzel kell kezdődnie)
+-- Read an attribute from a tag's attribute text (must start with whitespace)
 local function attr(attrs, name)
     if not attrs then return nil end
     local p = "%s" .. ci(name):gsub("%-", "%%-") .. "%s*=%s*"
@@ -171,7 +171,7 @@ local EXT_BY_TYPE = {
     ["image/png"] = "png",
 }
 
--- azw3 / mobi / KF8 -> EPUB konverzió a mellécsomagolt mobitool-lal (libmobi, külső függőség nélkül)
+-- azw3 / mobi / KF8 -> EPUB conversion using the bundled mobitool (libmobi, no external dependencies)
 local MOBI_FAMILY = { mobi = true, azw = true, azw3 = true, prc = true, kf8 = true, pdb = true }
 local function mobitoolBin() return plugin_dir .. "/bin/mobitool" end
 local function hasConverter() return lfs.attributes(mobitoolBin(), "mode") == "file" end
@@ -185,10 +185,10 @@ local function convertToEpub(path)
     os.remove(epub)
     os.execute(string.format("%q -e %q >/dev/null 2>&1", bin, path))
     if lfs.attributes(epub, "mode") == "file" then
-        -- Sikeres konverzió: a nem támogatott eredetit töröljük, hogy ne szennyezze
-        -- a tárhelyet és csak a KOReader által megnyitható EPUB maradjon.
-        -- Csak akkor, ha a forrást a KOReader eleve nem tudja megnyitni, és
-        -- ha az EPUB tényleg más fájl, mint a forrás.
+        -- Successful conversion: delete the unsupported original to avoid cluttering
+        -- storage, leaving only the EPUB that KOReader can open.
+        -- Only do this if KOReader cannot open the source and
+        -- the EPUB is actually a different file from the source.
         if epub ~= path and not DocumentRegistry:hasProvider(path) then
             os.remove(path)
         end
@@ -232,7 +232,7 @@ local function safeName(name)
         base = base:sub(1, 170):gsub("[\128-\255]+$", "")
         name = base .. ext
     end
-    if name == "" then name = "letoltes" end
+    if name == "" then name = "download" end
     return name
 end
 
@@ -245,7 +245,7 @@ local function sniffHtml(path)
 end
 
 ---------------------------------------------------------------------------
--- HTML feldolgozás
+-- HTML processing
 ---------------------------------------------------------------------------
 
 local function parsePage(html, page_url)
@@ -264,7 +264,7 @@ local function parsePage(html, page_url)
     clean = clean:gsub("<" .. ci("style") .. ".-</" .. ci("style") .. "%s*>", "")
     clean = clean:gsub("<" .. ci("noscript") .. "[^>]*>", ""):gsub("</" .. ci("noscript") .. "%s*>", "")
 
-    -- linkek
+    -- Links
     local seen = {}
     for attrs, inner in clean:gmatch("<[aA](%s[^>]*)>(.-)</[aA]%s*>") do
         local href = attr(attrs, "href")
@@ -273,7 +273,7 @@ local function parsePage(html, page_url)
             and not href:lower():match("^javascript:") and not href:lower():match("^mailto:")
             and not href:lower():match("^tel:") then
             local abs = url.absolute(base, href)
-            local uddg = abs:match("[?&]uddg=([^&]+)") -- DuckDuckGo átirányító link
+            local uddg = abs:match("[?&]uddg=([^&]+)") -- DuckDuckGo redirect link
             if uddg then abs = url.unescape(uddg) end
             abs = abs:gsub("#.*$", "")
             local text = stripTags(inner)
@@ -291,7 +291,7 @@ local function parsePage(html, page_url)
         end
     end
 
-    -- űrlapok
+    -- Forms
     local fnum = 0
     for fattrs, inner in clean:gmatch("<" .. ci("form") .. "([^>]*)>(.-)</" .. ci("form") .. "%s*>") do
         fnum = fnum + 1
@@ -325,7 +325,7 @@ local function parsePage(html, page_url)
                 end
             end
         end
-        -- <button> küldőgomb (alapértelmezett típusa submit)
+        -- <button> submit button (the default type is submit)
         for battrs in inner:gmatch("<" .. ci("button") .. "(%s[^>]*)>") do
             local bt = (attr(battrs, "type") or "submit"):lower()
             local bname = attr(battrs, "name")
@@ -365,7 +365,7 @@ local function parsePage(html, page_url)
         table.insert(page.forms, form)
     end
 
-    -- olvasható szöveg
+    -- Readable text
     local body = clean:match("<" .. ci("body") .. "[^>]*>(.*)") or clean
     body = body:gsub("<" .. ci("br") .. "[^>]*>", "\n")
     body = body:gsub("</" .. ci("p") .. "%s*>", "\n\n")
@@ -395,7 +395,7 @@ local function b64(s)
     return table.concat(out)
 end
 
--- <meta http-equiv="refresh"> vagy egyszerű JavaScript-átirányítás (pl. belépés után)
+-- <meta http-equiv="refresh"> or a simple JavaScript redirect (e.g. after login)
 local function findRedirect(html, base)
     local head = html:sub(1, 30000)
     for m in head:gmatch("<[mM][eE][tT][aA](%s[^>]*)>") do
@@ -406,7 +406,7 @@ local function findRedirect(html, base)
             if u and (tonumber(delay) or 0) <= 10 then return url.absolute(base, trim(u)) end
         end
     end
-    -- csak rövid oldalaknál, hogy egy nagy oldal feltételes szkriptje ne vigyen el
+    -- Only on short pages, so a conditional script on a large page does not redirect us
     if #html < 8000 then
         local u = html:match("location%.replace%(%s*['\"]([^'\"]+)['\"]")
             or html:match("location%.assign%(%s*['\"]([^'\"]+)['\"]")
@@ -427,10 +427,10 @@ local WebBrowser = WidgetContainer:extend{
     is_doc_only = false,
 }
 
--- A plugin saját, önálló adatmappája. Minden böngészőadat (kedvencek,
--- beállítások, NetSurf futásidejű fájlok, gyorsítótár, sütik) ide kerül, hogy a
--- plugin önálló legyen: a teljes eltávolítás = a plugin mappa törlése.
--- Frissítésnél EZT a data/ almappát kell kihagyni a felülírásból.
+-- The plugin's own self-contained data directory. All browser data (favorites,
+-- settings, NetSurf runtime files, cache, cookies) goes here to keep the
+-- plugin self-contained: full removal = deleting the plugin directory.
+-- When updating, exclude THIS data/ subdirectory from being overwritten.
 local function pluginDataDir()
     local d = plugin_dir
     if d:sub(1, 1) ~= "/" then d = lfs.currentdir() .. "/" .. d:gsub("^%./", "") end
@@ -467,7 +467,7 @@ function WebBrowser:init()
         on_menu = function() self:openKoreaderTopMenu() end,
         on_reader = function(u) self:openReaderView(u) end,
     }
-    -- Olvasóban (grafikus nézet): a linkre koppintva megjelenő ablakba saját gombok
+    -- In the reader (graphical view): add custom buttons to the dialog shown when tapping a link
     if self.ui.link and self.ui.link.addToExternalLinkDialog then
         local function closeDlg(this)
             pcall(function() UIManager:close(this.external_link_dialog) end)
@@ -504,14 +504,14 @@ function WebBrowser:init()
     end
     self.ui.menu:registerToMainMenu(self)
 
-    -- Gyors elérés: (1) gesztushoz köthető művelet (megbízható, verziófüggetlen),
-    -- (2) legjobb igyekezettel ikon a fájlkezelő felső ikonsávjába.
+    -- Quick access: (1) a gesture-bindable action (reliable, version-independent),
+    -- (2) a best-effort icon in the file manager's top icon bar.
     self:registerQuickAccess()
     self:addTopBarIcon()
 end
 
--- Egy gombnyomással megnyitja/folytatja az InkSurföt. Hozzárendelhető gesztushoz
--- a KOReader Beállítások → Gesztusok menüjében (ha a plugin elérhető ott).
+-- Open/resume InkSurf with one button press. Can be bound to a gesture
+-- in KOReader's Settings → Gestures menu (if the plugin is available there).
 function WebBrowser:registerQuickAccess()
     pcall(function()
         local Dispatcher = require("dispatcher")
@@ -537,19 +537,19 @@ function WebBrowser:onInkSurfOpen()
     return true
 end
 
--- Legjobb igyekezet: a böngésző ikonja a fájlkezelő felső ikonsávjába. KOReader-
--- verziófüggő; ha az adott verzió nem engedi, csendben kimarad (a menü marad az út).
+-- Best effort: add a browser icon to the file manager's top icon bar. Depends on
+-- the KOReader version; silently skip if unsupported (the menu remains available).
 function WebBrowser:addTopBarIcon()
     pcall(function()
         local ui = self.ui
         local tb = ui and ui.title_bar
         if not tb then return end
-        -- csak fájlkezelőben próbáljuk, és csak ha a címsor támogat jobb oldali ikont
+        -- Only try in the file manager, and only if the title bar supports a right-side icon
         local IconButton = require("ui/widget/iconbutton")
         local Geom = require("ui/geometry")
         if not (tb.addWidget or tb[2]) then return end
         local btn = IconButton:new{
-            icon = "appbar.search", -- általános ikon; nagyító-szerű
+            icon = "appbar.search", -- Generic magnifying-glass-style icon
             width = tb.button_width or 36,
             height = tb.button_width or 36,
             padding = tb.button_padding or 0,
@@ -574,7 +574,7 @@ function WebBrowser:torrentVpnOnly()
     return self.settings:nilOrTrue("torrent_vpn_only")
 end
 
--- torrent indítása: ha "csak VPN-en" és a VPN ki van kapcsolva, előbb felajánlja a bekapcsolást
+-- Start a torrent: if "VPN only" is enabled and the VPN is off, first offer to turn it on
 function WebBrowser:startTorrent(fn)
     if not self:torrentVpnOnly() or VPN:isUp() then
         fn()
@@ -603,14 +603,14 @@ function WebBrowser:addToMainMenu(menu_items)
                     dlg = InputDialog:new{
                         title = S("Keresés a weben"),
                         input = "",
-                        input_hint = "mit keresel?",
+                        input_hint = "what are you looking for?",
                         buttons = {{
                             { text = S("Mégse"), callback = function() UIManager:close(dlg) end },
                             { text = S("Keresés"), is_enter_default = true, callback = function()
                                 local qy = dlg:getInputText()
                                 UIManager:close(dlg)
                                 if qy and qy ~= "" then
-                                    -- NetSurfben nyitjuk: a DuckDuckGo a szöveges böngészőt botnak nézi (CAPTCHA)
+                                    -- Open in NetSurf: DuckDuckGo treats the text browser as a bot (CAPTCHA)
                                     NetSurf:run("https://html.duckduckgo.com/html/?q=" .. url.escape(qy))
                                 end
                             end },
@@ -628,7 +628,7 @@ function WebBrowser:addToMainMenu(menu_items)
                     dlg = InputDialog:new{
                         title = S("Cím megnyitása"),
                         input = "https://",
-                        input_hint = "https://pelda.hu",
+                        input_hint = "https://example.com",
                         buttons = {{
                             { text = S("Mégse"), callback = function() UIManager:close(dlg) end },
                             { text = S("Megnyitás"), is_enter_default = true, callback = function()
@@ -662,7 +662,7 @@ function WebBrowser:addToMainMenu(menu_items)
             {
                 text_func = function()
                     local n = Torrent:countActive()
-                    return "Torrentek" .. (n > 0 and (" – " .. n .. " fut") or "")
+                    return "Torrents" .. (n > 0 and (" – " .. n .. " running") or "")
                 end,
                 callback = function() Torrent:showManager() end,
             },
@@ -684,13 +684,13 @@ function WebBrowser:addToMainMenu(menu_items)
                                 callback = function() self:setUiLang("en") end,
                             },
                             {
-                                text = "Magyar",
+                                text = "Hungarian",
                                 radio = true,
                                 checked_func = function() return I18N.get() == "hu" end,
                                 callback = function() self:setUiLang("hu") end,
                             },
                             {
-                                text = "Deutsch",
+                                text = "German",
                                 radio = true,
                                 checked_func = function() return I18N.get() == "de" end,
                                 callback = function() self:setUiLang("de") end,
@@ -818,7 +818,7 @@ function WebBrowser:addToMainMenu(menu_items)
     }
 end
 
--- Teljes kitakarítás (a plugin data/ almappája + régi szórt fájlok) ----------
+-- Full cleanup (the plugin's data/ subdirectory + legacy scattered files) ----------
 
 function WebBrowser:confirmPurge()
     UIManager:show(ConfirmBox:new{
@@ -849,11 +849,11 @@ function WebBrowser:purgeAllData()
         os.remove(path)
     end
 
-    -- Minden böngészőadat a plugin data/ almappájában van: töröljük az egészet.
+    -- All browser data is in the plugin's data/ subdirectory: delete it all.
     rmtree(self.data_dir)
 
-    -- Régi (0.x) telepítésekből esetleg ottmaradt szórt fájlok a törzsmappában +
-    -- a régi közös VPN-kulcs — ezeket is takarítsuk, hogy tényleg tiszta legyen.
+    -- Scattered files in the root directory possibly left by old (0.x) installations +
+    -- the old shared VPN key — remove these too for a truly clean reset.
     local legacy = DataStorage:getDataDir()
     for _, name in ipairs({
         "netsurf.log", "netsurf.pid", "netsurf.signal", "netsurf.state",
@@ -875,7 +875,7 @@ function WebBrowser:purgeAllData()
         G_reader_settings:flush()
     end
 
-    -- memóriabeli beállítások nullázása, hogy ne íródjanak vissza
+    -- Clear in-memory settings so they are not written back
     self.data_dir = pluginDataDir()
     self.settings = LuaSettings:open(self.data_dir .. "/inksurf.lua")
 
@@ -887,7 +887,7 @@ function WebBrowser:purgeAllData()
     })
 end
 
--- Nyelvválasztás -------------------------------------------------------------
+-- Language selection -------------------------------------------------------------
 
 function WebBrowser:setUiLang(lang)
     I18N.set(lang)
@@ -905,7 +905,7 @@ function WebBrowser:start()
     self:showHome()
 end
 
--- Letöltési mappa ------------------------------------------------------------
+-- Download directory ------------------------------------------------------------
 
 function WebBrowser:downloadDir()
     local dir = self.settings:readSetting("download_dir")
@@ -936,7 +936,7 @@ function WebBrowser:chooseDownloadDir()
     UIManager:show(chooser)
 end
 
--- UI segédek ---------------------------------------------------------------
+-- UI helpers ---------------------------------------------------------------
 
 function WebBrowser:status(text)
     if self.msg then
@@ -989,7 +989,7 @@ function WebBrowser:closeMenu()
     end
 end
 
--- Könyvjelzők --------------------------------------------------------------
+-- Bookmarks --------------------------------------------------------------
 
 function WebBrowser:getBookmarks()
     local b = self.settings:readSetting("bookmarks")
@@ -1090,7 +1090,7 @@ function WebBrowser:deleteBookmark(i)
     })
 end
 
--- Képernyők ------------------------------------------------------------------
+-- Screens ------------------------------------------------------------------
 
 function WebBrowser:showHome()
     local items = {
@@ -1117,7 +1117,7 @@ function WebBrowser:showHome()
     })
     local n = Torrent:countActive()
     table.insert(items, {
-        text = S("⇩ Torrent letöltések") .. (n > 0 and (" (" .. n .. " fut)") or ""),
+        text = S("⇩ Torrent letöltések") .. (n > 0 and (" (" .. n .. " running)") or ""),
         callback = function() Torrent:showManager() end,
     })
     table.insert(items, {
@@ -1127,7 +1127,7 @@ function WebBrowser:showHome()
     self:ensureMenu(S("Web böngésző – kedvencek"), items)
 end
 
-local VIEW_NAMES = { graphic = "grafikus", text = S("szöveges") }
+local VIEW_NAMES = { graphic = "graphical", text = S("szöveges") }
 
 function WebBrowser:chooseView(page)
     local dlg
@@ -1303,7 +1303,7 @@ function WebBrowser:askUrl()
     dlg:onShowKeyboard()
 end
 
--- Űrlapok --------------------------------------------------------------------
+-- Forms --------------------------------------------------------------------
 
 function WebBrowser:fillForm(page, form)
     local editable = {}
@@ -1351,7 +1351,7 @@ function WebBrowser:submitForm(page, form)
     end
 end
 
--- Hálózat --------------------------------------------------------------------
+-- Network --------------------------------------------------------------------
 
 local function baseDomain(host)
     return host:match("[^.]+%.[^.]+$") or host
@@ -1456,7 +1456,7 @@ end
 
 function WebBrowser:go(target, opts)
     opts = opts or {}
-    -- a grafikus nézetben az űrlapok helyén lévő "kitöltés" linkek
+    -- The "fill in" links that replace forms in the graphical view
     local fidx = target:match("^https?://wbform%.invalid/(%d+)")
     if fidx then
         local pg = State.current
@@ -1485,7 +1485,7 @@ function WebBrowser:load(target, opts)
     local ctype = (res.headers["content-type"] or ""):lower()
     local cdisp = res.headers["content-disposition"] or ""
 
-    -- HTTP Basic hitelesítés (a böngésző saját felugró jelszókérése)
+    -- HTTP Basic authentication (the browser's own password prompt)
     if res.code == 401 then
         local wa = res.headers["www-authenticate"] or ""
         if wa:lower():find("basic", 1, true) then
@@ -1495,14 +1495,14 @@ function WebBrowser:load(target, opts)
         end
     end
 
-    -- .torrent -> aria2 a háttérben (hosszan nyomva "Mentés fájlként" továbbra is a nyers fájlt menti)
+    -- .torrent -> aria2 in the background (long-pressing "Save as file" still saves the raw file)
     local fname = filenameFromDisposition(cdisp) or filenameFromUrl(res.url) or ""
     if not opts.force_save and res.code < 400
         and (ctype:find("bittorrent", 1, true) or fname:lower():match("%.torrent$")) then
         local f = io.open(res.tmp, "rb")
         local data = f and f:read("*a") or ""
         if f then f:close() end
-        if data:sub(1, 1) == "d" then -- bencode szótár = valódi torrent fájl
+        if data:sub(1, 1) == "d" then -- bencode dictionary = a real torrent file
             os.remove(res.tmp)
             self:status(nil)
             local name = fname:gsub("%.[tT][oO][rR][rR][eE][nN][tT]$", "")
@@ -1520,7 +1520,7 @@ function WebBrowser:load(target, opts)
         local html = f and f:read("*a") or ""
         if f then f:close() end
         os.remove(res.tmp)
-        -- továbbirányítás (meta refresh / egyszerű JS), pl. sikeres belépés után
+        -- Redirect (meta refresh / simple JS), e.g. after a successful login
         local redirect = findRedirect(html, res.url)
         if redirect and redirect ~= res.url and (opts.hops or 0) < 3 and not redirect:lower():match("^javascript:") then
             return self:load(redirect, {
@@ -1538,7 +1538,7 @@ function WebBrowser:load(target, opts)
 
 
         if State.current then
-            State.current.html = nil -- memória: csak az aktuális oldal nyers HTML-jét tartjuk meg
+            State.current.html = nil -- Memory: only keep the raw HTML of the current page
             table.insert(State.history, State.current)
             if #State.history > 30 then table.remove(State.history, 1) end
         end
@@ -1586,8 +1586,8 @@ function WebBrowser:askBasicAuth(target, opts, host, realm)
     dlg:onShowKeyboard()
 end
 
--- Ha űrlapküldés után a szerver újra egy jelszómezős lapot ad ugyanarról az oldalról,
--- a belépés valószínűleg nem sikerült: elmondjuk, és megmutatjuk a lap hibaüzenetét.
+-- If submitting a form returns another page with a password field from the same site,
+-- login probably failed: notify the user and show the page's error message.
 function WebBrowser:loginFailureText(page, html, sent)
     if not sent.is_login then return nil end
     if hostOf(page.url) ~= hostOf(sent.url) then return nil end
@@ -1624,8 +1624,8 @@ function WebBrowser:loginFailureText(page, html, sent)
     return text
 end
 
--- Olvasó nézet: a megadott URL cikkét helyben (harmadik fél nélkül) kivonatolja,
--- és a meglévő grafikus nézetben jeleníti meg. A NetSurf sáv olvasó-ikonja hívja.
+-- Reader view: extract the article at the given URL locally (without a third party)
+-- and display it in the existing graphical view. Called by the NetSurf bar's reader icon.
 function WebBrowser:openReaderView(target)
     if not target or target == "" or target == "about:welcome" then
         return self:showError(S("Nincs megnyitott cikk az olvasó nézethez."))
@@ -1677,7 +1677,7 @@ function WebBrowser:cacheRoot()
     return root
 end
 
--- új mappa egy oldalnak; a régieket (a 25 legutóbbin túl) törli
+-- New directory for a page; delete old ones (beyond the 25 most recent)
 function WebBrowser:newPageDir()
     local root = self:cacheRoot()
     local dirs = {}
@@ -1726,13 +1726,13 @@ function WebBrowser:fetchImage(img_url, dest_base, referer)
     return final:match("([^/]+)$")
 end
 
--- 1. profil: grafikus megjelenítés a KOReader saját HTML-motorjával
+-- Profile 1: graphical rendering with KOReader's own HTML engine
 function WebBrowser:openGraphic(page)
     if page.file and lfs.attributes(page.file, "mode") == "file" then
         return self:openInReader(page.file)
     end
     if not page.html then
-        -- régebbi oldal, a HTML-t már nem tartjuk: újra letöltjük
+        -- Older page, HTML no longer retained: download it again
         return self:go(page.url, { view = "graphic" })
     end
     self:status(S("Oldal előkészítése…\n") .. page.url)
@@ -1773,7 +1773,7 @@ function WebBrowser:openInReader(path)
 end
 
 function WebBrowser:saveDownload(res, ctype, cdisp)
-    local name = filenameFromDisposition(cdisp) or filenameFromUrl(res.url) or "letoltes"
+    local name = filenameFromDisposition(cdisp) or filenameFromUrl(res.url) or "download"
     if not name:match("%.[%w]+$") then
         local ext = EXT_BY_TYPE[ctype:match("^[^;%s]+") or ""]
         if ext then name = name .. "." .. ext end
@@ -1806,7 +1806,7 @@ function WebBrowser:saveDownload(res, ctype, cdisp)
     local text = S("Letöltve (") .. fmtSize(size) .. "):\n" .. path
     if DocumentRegistry:hasProvider(path) then
         UIManager:show(ConfirmBox:new{
-            text = text .. "\n\nMegnyitod most?",
+            text = text .. "\n\nOpen it now?",
             ok_text = S("Megnyitás"),
             cancel_text = S("Később"),
             ok_callback = function()
@@ -1815,7 +1815,7 @@ function WebBrowser:saveDownload(res, ctype, cdisp)
             end,
         })
     else
-        -- nem támogatott formátum: ha azw3/mobi-család ÉS van konverter, EPUB-ra alakítjuk
+        -- Unsupported format: if it belongs to the azw3/mobi family AND a converter is available, convert to EPUB
         local dlext = (path:match("%.([%w]+)$") or ""):lower()
         if MOBI_FAMILY[dlext] and hasConverter() then
             UIManager:show(ConfirmBox:new{
@@ -1842,7 +1842,7 @@ function WebBrowser:saveDownload(res, ctype, cdisp)
     end
 end
 
--- NetSurf kedvencek (a beállításokban tárolva: {title, url} lista)
+-- NetSurf favorites (stored in settings: a list of {title, url} pairs)
 function WebBrowser:getNetsurfFavorites()
     local f = self.settings:readSetting("netsurf_favorites")
     if type(f) ~= "table" then f = {} end
@@ -1854,7 +1854,7 @@ function WebBrowser:saveNetsurfFavorites(f)
     self.settings:flush()
 end
 
--- NetSurf előzmények almenü (utolsó 5 egyedi látogatott cím)
+-- NetSurf history submenu (last 5 unique visited URLs)
 function WebBrowser:netsurfHistoryMenu()
     local items = {}
     local list = NetSurf:historyList(5)
@@ -1882,7 +1882,7 @@ function WebBrowser:netsurfHistoryMenu()
     return items
 end
 
--- Súgó / Névjegy
+-- Help / About
 local HELP_TEXT = {
     hu = table.concat({
         "InkSurf böngésző – súgó / névjegy",
@@ -2055,9 +2055,9 @@ function WebBrowser:netsurfFavoritesMenu()
     return items
 end
 
--- A NetSurf alatt letöltött fájl(ok) kezelése kilépés után: megnyitás / EPUB-konverzió
--- A KOReader felső menüjének megnyitása (a böngésző felső éléről lehúzva).
--- Verziófüggetlen, legjobb igyekezet: a menü-objektum ismert metódusait próbáljuk.
+-- Handle files downloaded in NetSurf after exiting: open / convert to EPUB
+-- Open KOReader's top menu (by swiping down from the browser's top edge).
+-- Version-independent best effort: try known methods on the menu object.
 function WebBrowser:openKoreaderTopMenu()
     pcall(function()
         local ui = self.ui
@@ -2073,9 +2073,9 @@ function WebBrowser:openKoreaderTopMenu()
     end)
 end
 
--- KOReader által NEM megnyitható kész fájl(ok): ha van köztük MOBI-családbeli
--- (azw3/mobi/…) és megvan a konverter, EPUB-ra alakítást ajánlunk; különben csak
--- jelezzük, hogy elmentve. Közös út a NetSurf-letöltéshez és a torrenthez.
+-- Completed files that KOReader CANNOT open: if any belong to the MOBI family
+-- (azw3/mobi/…) and a converter is available, offer conversion to EPUB; otherwise
+-- just report that they were saved. Shared path for NetSurf downloads and torrents.
 function WebBrowser:offerConvertOrSaved(paths)
     if not paths or #paths == 0 then return end
     local target
@@ -2106,7 +2106,7 @@ end
 function WebBrowser:handleNetsurfDownloads(paths)
     if not paths or #paths == 0 then return end
 
-    -- .torrent fájlokat NEM megnyitjuk, hanem átadjuk az aria2-nek, majd töröljük őket
+    -- Do NOT open .torrent files; pass them to aria2, then delete them
     local rest = {}
     for _, p in ipairs(paths) do
         if (p:match("%.([%w]+)$") or ""):lower() == "torrent" then
@@ -2117,7 +2117,7 @@ function WebBrowser:handleNetsurfDownloads(paths)
                 local name = (p:match("([^/]+)$") or "torrent")
                 self:startTorrent(function() Torrent:addTorrent(data, name) end)
             end
-            os.remove(p)   -- a .torrent fájl ne halmozódjon
+            os.remove(p)   -- Prevent .torrent files from accumulating
         else
             rest[#rest + 1] = p
         end
@@ -2132,7 +2132,7 @@ function WebBrowser:handleNetsurfDownloads(paths)
     if extra > 0 then text = text .. "\n(+" .. extra .. S(" további fájl a letöltési mappában)") end
     if DocumentRegistry:hasProvider(path) then
         UIManager:show(ConfirmBox:new{
-            text = text .. "\n\nMegnyitod most?",
+            text = text .. "\n\nOpen it now?",
             ok_text = S("Megnyitás"), cancel_text = S("Később"),
             ok_callback = function() require("apps/reader/readerui"):showReader(path) end,
         })

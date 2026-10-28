@@ -1,9 +1,9 @@
-# Soha ne kerüljön fel: VPN-adatok és futásidejű fájlok
+# Never commit VPN credentials or runtime files
 inksurf.koplugin/vpn/*.ovpn
 inksurf.koplugin/vpn/*.auth
 inksurf.koplugin/vpn/auth.txt
 inksurf.koplugin/data/
-# Napló / build melléktermék
+# Logs and build artifacts
 *.log
 netsurf.log
 netsurf_field.log

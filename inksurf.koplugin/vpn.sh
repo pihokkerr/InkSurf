@@ -1,12 +1,12 @@
 #!/bin/sh
-# BookFetch – VPN vezérlő Kindle-re (OpenVPN + IPv6-tiltás + kill switch + DNS)
+# BookFetch – VPN controller for Kindle (OpenVPN + disabling IPv6 + kill switch + DNS)
 #
-# Használat:
-#   sh vpn.sh up <fajl.ovpn> <auth.txt>
+# Usage:
+#   sh vpn.sh up <file.ovpn> <auth.txt>
 #   sh vpn.sh down
 #   sh vpn.sh status
 #
-# Kimenet utolsó sora mindig:  "OK ..."  vagy  "HIBA ..."
+# The last output line is always:  "OK ..."  or  "HIBA ..."
 
 DIR=$(cd "$(dirname "$0")" && pwd)
 BIN="$DIR/bin"
@@ -24,7 +24,7 @@ is_running() {
     [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null
 }
 
-# ---------- IPv6 (különben az otthoni IPv6-cím kiszivárog) ----------
+# ---------- IPv6 (otherwise the home IPv6 address leaks) ----------
 ipv6_off() {
     for ifc in all default wlan0; do
         p=/proc/sys/net/ipv6/conf/$ifc/disable_ipv6
@@ -44,27 +44,27 @@ ipv6_restore() {
     done
 }
 
-# ---------- Tűzfal: tun0 válaszok engedése + kill switch ----------
+# ---------- Firewall: allow tun0 replies + kill switch ----------
 fw_up() {
     server="$1"
     lan="$2"
     rproto="$3"
     rport="$4"
-    # A Kindle tűzfala csak a wlan0-n érkező válaszokat engedi – tun0 kell mellé
+    # The Kindle firewall only allows replies on wlan0 – tun0 must be allowed too
     iptables -I INPUT -i tun0 -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-    # Kill switch: kifelé csak a VPN-alagút, a VPN-szerver és a helyi hálózat
+    # Kill switch: outbound traffic only through the VPN tunnel, to the VPN server and local network
     iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"
     iptables -A "$CHAIN" -o lo -j ACCEPT
     iptables -A "$CHAIN" -o tun0 -j ACCEPT
     [ -n "$server" ] && iptables -A "$CHAIN" -d "$server" -j ACCEPT
-    # Az alagút saját forgalma a VPN-portra – akkor is, ha az OpenVPN másik
-    # szerver-IP-re kapcsolódik újra (remote-random), vagy a napló nem adta meg az IP-t
+    # The tunnel's own traffic to the VPN port – even if OpenVPN reconnects to another
+    # server IP (remote-random), or the log did not provide the IP
     [ -n "$rport" ] && iptables -A "$CHAIN" -o wlan0 -p "$rproto" --dport "$rport" -j ACCEPT
-    # DHCP (különben órák múlva lejár a wifi címbérlete)
+    # DHCP (otherwise the Wi-Fi address lease expires after a few hours)
     iptables -A "$CHAIN" -o wlan0 -p udp --dport 67:68 -j ACCEPT
-    # DNS a saját feloldóinkhoz wlan0-n is: hogy ha a wifi lealszik és az alagút
-    # leesik, az OpenVPN fel tudja oldani a szerver nevét és újracsatlakozzon.
+    # Allow DNS to our resolvers on wlan0 too: if Wi-Fi sleeps and the tunnel
+    # drops, OpenVPN can resolve the server name and reconnect.
     for d in "$FALLBACK_DNS" 8.8.8.8; do
         iptables -A "$CHAIN" -o wlan0 -d "$d" -p udp --dport 53 -j ACCEPT
         iptables -A "$CHAIN" -o wlan0 -d "$d" -p tcp --dport 53 -j ACCEPT
@@ -74,20 +74,20 @@ fw_up() {
     iptables -I OUTPUT 1 -j "$CHAIN"
 }
 
-# ---------- Wifi ébren tartása (a Kindle pár perc tétlenség után kikapcsolja) ----------
+# ---------- Keep Wi-Fi awake (the Kindle turns it off after a few idle minutes) ----------
 wifi_keepawake() {
-    # energiatakarékos mód ki a wlan0-n (ha az iwconfig/driver támogatja)
+    # Disable power saving on wlan0 (if supported by iwconfig/the driver)
     iwconfig wlan0 power off 2>/dev/null
     for ps in /sys/class/net/wlan0/device/power/control; do
         [ -w "$ps" ] && echo on > "$ps" 2>/dev/null
     done
-    # a Kindle energiakezelőjének szólunk, hogy tartsa a wifit (ha elérhető)
+    # Tell the Kindle power manager to keep Wi-Fi enabled (if available)
     lipc-set-prop com.lab126.cmd wirelessEnable 1 2>/dev/null || true
     lipc-set-prop com.lab126.wifid enable 1 2>/dev/null || true
 }
 
-# VPN-kikapcsoláskor visszaállítjuk az energiatakarékos módot, hogy ne fogyjon
-# többet az olvasó, mint VPN nélkül.
+# Restore power saving when the VPN is turned off so the reader does not
+# consume more power than it would without the VPN.
 wifi_restore() {
     iwconfig wlan0 power on 2>/dev/null
     for ps in /sys/class/net/wlan0/device/power/control; do
@@ -102,15 +102,15 @@ fw_down() {
     while iptables -D INPUT -i tun0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do :; done
 }
 
-# ---------- DNS (különben a router látja, mit keresel) ----------
-# A Kindle hálózati démona visszaírhatja a resolv.conf-ot a router DNS-ére,
-# amit a kill switch blokkol -> DNS elhal. Ezért zároljuk (chattr +i).
-# Megbízható, az alagúton át (0.0.0.0/1 route) elérhető DNS-t használunk.
+# ---------- DNS (otherwise the router sees what you look up) ----------
+# The Kindle network daemon may rewrite resolv.conf to use the router's DNS,
+# which the kill switch blocks -> DNS stops working. Lock it to prevent this (chattr +i).
+# Use reliable DNS reachable through the tunnel (0.0.0.0/1 route).
 dns_set() {
     vpn_dns="$1"
-    # ha resolv.conf szimbolikus link, előbb feloldjuk valódi fájllá
+    # If resolv.conf is a symbolic link, replace it with a regular file first
     if [ -L /etc/resolv.conf ]; then
-        # a KÖZVETLEN link-célt mentjük (nem a végső fájlt), hogy pontosan visszaállítható legyen
+        # Save the DIRECT link target (not the final file) so it can be restored exactly
         tgt=$(readlink /etc/resolv.conf 2>/dev/null)
         rm -f /etc/resolv.conf
         : > /etc/resolv.conf
@@ -123,15 +123,15 @@ dns_set() {
         printf 'nameserver %s\n' "$FALLBACK_DNS"
         printf 'nameserver %s\n' 8.8.8.8
     } > /etc/resolv.conf
-    # zárolás, hogy a rendszer ne írja vissza (ha az fs/chattr támogatja)
+    # Lock it so the system cannot overwrite it (if supported by the filesystem/chattr)
     chattr +i /etc/resolv.conf 2>/dev/null
 }
 
 dns_restore() {
     chattr -i /etc/resolv.conf 2>/dev/null
     if [ -f "$ST/resolv.link" ]; then
-        # eredetileg szimbolikus link volt -> visszaállítjuk a LINKET, hogy a rendszer
-        # DNS-démona újra kezelhesse (különben beragad a statikus fájl -> nincs névfeloldás)
+        # It was originally a symbolic link -> restore the LINK so the system's
+        # DNS daemon can manage it again (otherwise the static file persists -> no name resolution)
         tgt=$(cat "$ST/resolv.link" 2>/dev/null)
         rm -f /etc/resolv.conf
         [ -n "$tgt" ] && ln -s "$tgt" /etc/resolv.conf 2>/dev/null
@@ -142,7 +142,7 @@ dns_restore() {
     fi
 }
 
-# ---------- Fő műveletek ----------
+# ---------- Main operations ----------
 do_down() {
     if [ -f "$PIDF" ]; then
         kill "$(cat "$PIDF")" 2>/dev/null
@@ -161,8 +161,8 @@ do_down() {
 do_up() {
     ovpn="$1"
     auth="$2"
-    [ -f "$ovpn" ] || fail "Nem található az .ovpn fájl: $ovpn"
-    [ -f "$auth" ] || fail "Nem található az auth.txt"
+    [ -f "$ovpn" ] || fail ".ovpn file not found: $ovpn"
+    [ -f "$auth" ] || fail "auth.txt not found"
     [ -x "$BIN/openvpn" ] || chmod +x "$BIN/openvpn" 2>/dev/null
 
     if is_running; then
@@ -170,10 +170,10 @@ do_up() {
         exit 0
     fi
 
-    # Esetleges korábbi maradványok eltakarítása
+    # Clean up any leftovers from a previous run
     do_down
 
-    # Windows-sorvégek és OpenVPN 2.6-ban már hibás direktívák kiszűrése
+    # Strip Windows line endings and directives no longer valid in OpenVPN 2.6
     tr -d '\r' < "$ovpn" | grep -v -E '^[[:space:]]*(keysize|auth-user-pass)' > "$ST/cfg.ovpn"
     tr -d '\r' < "$auth" > "$ST/auth"
     chmod 600 "$ST/auth"
@@ -182,9 +182,9 @@ do_up() {
     wifi_keepawake
     rm -f "$LOG"
 
-    # --ping/--ping-restart: ha a wifi lealszik és visszajön, az OpenVPN magától
-    #   újraépíti az alagutat (nem kell kézzel újracsatlakozni).
-    # --persist-tun: a tun0 és a route-ok megmaradnak a reconnect alatt.
+    # --ping/--ping-restart: if Wi-Fi sleeps and comes back, OpenVPN automatically
+    #   rebuilds the tunnel (no manual reconnection needed).
+    # --persist-tun: tun0 and the routes are preserved during reconnection.
     "$BIN/openvpn" --config "$ST/cfg.ovpn" \
         --auth-user-pass "$ST/auth" --auth-nocache \
         --pull-filter ignore "ifconfig-ipv6" \
@@ -206,31 +206,31 @@ do_up() {
         if [ $i -gt 3 ] && ! is_running; then
             err=$(tail -n 1 "$LOG" 2>/dev/null | cut -c21-)
             do_down
-            fail "Az OpenVPN leállt: $err"
+            fail "OpenVPN stopped: $err"
         fi
         sleep 1
         i=$((i + 1))
     done
     if [ $i -ge 40 ]; then
         do_down
-        fail "Időtúllépés (40 mp) – nincs kapcsolat a VPN-szerverrel"
+        fail "Timed out (40 s) – no connection to the VPN server"
     fi
 
-    # VPN-szerver címe (ezt az útvonalat az OpenVPN maga veszi fel)
+    # VPN server address (OpenVPN adds this route itself)
     server=$(grep -o 'net_route_v4_add: [0-9.]*/32 via' "$LOG" | tail -n 1 | awk '{print $2}' | cut -d/ -f1)
-    # Helyi hálózat (pl. 10.0.0.0/24) – hogy az SSH a gépről továbbra is menjen
+    # Local network (e.g. 10.0.0.0/24) – keep SSH access from the computer working
     lan=$(ip route 2>/dev/null | awk '/dev wlan0/ && /scope link/ {print $1; exit}')
     if [ -z "$lan" ]; then
-        # tartalék, ha nincs "ip" parancs: route -n (hálózat + maszk)
+        # Fallback if the "ip" command is unavailable: route -n (network + netmask)
         lan=$(route -n 2>/dev/null | awk '$8=="wlan0" && $2=="0.0.0.0" && $1!="0.0.0.0" {print $1"/"$3; exit}')
     fi
-    # VPN-szerver portja és protokollja a konfigurációból
+    # VPN server port and protocol from the configuration
     rport=$(awk '/^[[:space:]]*remote[[:space:]]/ && $3 != "" {print $3; exit}' "$ST/cfg.ovpn")
     [ -n "$rport" ] || rport=$(awk '/^[[:space:]]*port[[:space:]]/ {print $2; exit}' "$ST/cfg.ovpn")
     [ -n "$rport" ] || rport=1194
     rproto=$(awk '/^[[:space:]]*proto[[:space:]]/ {print $2; exit}' "$ST/cfg.ovpn")
     case "$rproto" in tcp*) rproto=tcp ;; *) rproto=udp ;; esac
-    # A VPN által adott DNS
+    # DNS provided by the VPN
     dns=$(grep -o 'dhcp-option DNS [0-9.]*' "$LOG" | tail -n 1 | awk '{print $3}')
     [ -n "$dns" ] || dns=$FALLBACK_DNS
 
@@ -238,7 +238,7 @@ do_up() {
     dns_set "$dns"
 
     ip=$(wget -T 10 -qO- http://ifconfig.me/ip 2>/dev/null)
-    [ -n "$ip" ] || ip="(az IP-cím lekérdezése nem sikerült)"
+    [ -n "$ip" ] || ip="(could not retrieve the IP address)"
     echo "OK $ip"
 }
 
@@ -250,12 +250,12 @@ do_status() {
     fi
 }
 
-# ön-gyógyítás: ha a VPN NEM fut, de maradt beragadt kill switch vagy zárolt/statikus
-# resolv.conf egy korábbi (megszakadt) futásból, takarítsuk ki, hogy legyen internet.
+# Self-healing: if the VPN is NOT running but a stuck kill switch or locked/static
+# resolv.conf remains from a previous (interrupted) run, clean up to restore internet access.
 do_heal() {
     is_running && return 0
     fw_down 2>/dev/null
-    # a resolv.conf feloldása mindenképp (az immutable flag túléli az újraindítást is!)
+    # Always unlock resolv.conf (the immutable flag survives a reboot!)
     chattr -i /etc/resolv.conf 2>/dev/null
     dns_restore
     ipv6_restore 2>/dev/null
@@ -267,5 +267,5 @@ case "$1" in
     down)   do_down; echo "OK" ;;
     heal)   do_heal; echo "OK" ;;
     status) do_status ;;
-    *)      fail "Használat: vpn.sh up <ovpn> <auth> | down | heal | status" ;;
+    *)      fail "Usage: vpn.sh up <ovpn> <auth> | down | heal | status" ;;
 esac

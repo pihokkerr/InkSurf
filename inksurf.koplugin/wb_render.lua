@@ -1,8 +1,8 @@
 --[[
-1. profil – általános grafikus megjelenítés.
-A letöltött oldalt megtisztított HTML-fájllá alakítja (képekkel), amit a KOReader
-saját motorja (crengine) rajzol ki. A linkek abszolút címet kapnak, így
-koppintásra a KOReader linkablakában megjelenik a "Megnyitás a böngészőben" gomb.
+Profile 1 – general graphical rendering.
+Convert the downloaded page to a cleaned HTML file (with images), rendered by
+KOReader's own engine (crengine). Links are given absolute URLs so that tapping
+them shows the "Open in browser" button in KOReader's link dialog.
 ]]
 
 local H = package.loaded["inksurf_html"]
@@ -17,12 +17,12 @@ local function set(list)
     return t
 end
 
--- teljesen kihagyott elemek
+-- elements omitted entirely
 local DROP = set("script style link meta base iframe frame frameset object embed applet canvas video audio "
     .. "template svg math input select textarea button head dialog map")
--- ezeknek csak a tartalma kell
+-- only the contents of these elements are needed
 local UNWRAP = set("html body noscript font center span label picture")
--- ezek után szóköz kell, különben a CSS nélkül egymás mellé kerülő szövegek összefolynak
+-- add a space after these elements so adjacent text does not run together without CSS
 local SPACE_AFTER = set("span label")
 local KEEP_ATTRS = set("id name colspan rowspan title lang dir")
 
@@ -45,12 +45,12 @@ local function isHidden(a)
     return false
 end
 
--- Paraméterek:
+-- Parameters:
 --   dom, page_url, title, charset
---   out_dir: ide kerül az index.html és a képek
---   images: képek letöltése (bool), max_images
---   fetch_image(abs_url, dest_base) -> fájlnév (dest_base + kiterjesztés) vagy nil
---   progress(n, total): opcionális
+--   out_dir: destination for index.html and images
+--   images: download images (bool), max_images
+--   fetch_image(abs_url, dest_base) -> filename (dest_base + extension) or nil
+--   progress(n, total): optional
 function R.render(o)
     local out = {}
     local function emit(s) out[#out + 1] = s end
@@ -58,7 +58,7 @@ function R.render(o)
     local form_idx = 0
     local base = o.page_url
 
-    -- képek számának előzetes becslése a folyamatjelzőhöz
+    -- estimate the image count in advance for the progress indicator
     local total_imgs = 0
     if o.images then
         total_imgs = math.min(#H.select(o.dom, "img"), o.max_images or 40)
@@ -81,7 +81,7 @@ function R.render(o)
             return
         end
         if src:sub(1, 5):lower() == "data:" then
-            -- beágyazott kép (gyakran csak 1x1-es helyőrző) – kihagyjuk
+            -- embedded image (often just a 1x1 placeholder) – skip it
             if alt then emit("[" .. escText(alt) .. "]") end
             return
         end
@@ -111,15 +111,15 @@ function R.render(o)
             else
                 local t, a = ch.tag, ch.attrs
                 if DROP[t] or isHidden(a) then
-                    -- kihagyva
+                    -- omitted
                 elseif t == "form" then
-                    -- az űrlapmezők itt nem működnek: a helyükre egy "kitöltés" link kerül,
-                    -- ami a böngésző űrlap-párbeszédét nyitja meg
+                    -- form fields do not work here: replace them with a "fill in" link
+                    -- that opens the browser's form dialog
                     form_idx = form_idx + 1
                     local label = o.form_labels and o.form_labels[form_idx]
                     if label then
                         emit('<p><a href="https://wbform.invalid/' .. form_idx .. '"><b>[ ✎ ' .. escText(label)
-                            .. ' – koppints ide a kitöltéshez ]</b></a></p>')
+                            .. ' – tap here to fill in ]</b></a></p>')
                     end
                     walk(ch)
                 elseif UNWRAP[t] then
