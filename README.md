@@ -78,3 +78,4 @@ Telepítés: a `inksurf.koplugin` mappát másold a `koreader/plugins/`-ba, és 
 (a repo **nem** tartalmaz VPN-adatokat). A felület nyelve (angol/magyar/német) a
 beállításokban váltható. Licenc: GPL-2.0-or-later; a bundle-olt komponensek licencei a
 `THIRD_PARTY_NOTICES.md`-ben.
+.
